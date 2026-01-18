@@ -13,17 +13,7 @@ node server.js
 
 ## 调试（排查 fetch failed）
 
-开启详细出站请求日志（会自动对 `authorization/apikey/x-signed-token/x-csrf-token` 等做掩码）：
-
-```bash
-DEBUG_HTTP=1 node server.js
-```
-
-如需同时打印请求/响应体片段（仍会做字段级掩码，但建议仅在本地排查时开启）：
-
-```bash
-DEBUG_HTTP=1 DEBUG_HTTP_BODY=1 node server.js
-```
+默认不输出详细调试日志（避免误把敏感信息打到日志里）。如需我加一个“仅本地可用”的调试开关，再说一声。
 
 如果你看到类似 `UND_ERR_CONNECT_TIMEOUT`，常见是 IPv6 “可解析但不可达”导致连接一直卡住。可以用以下方式排查/修复：
 
@@ -54,14 +44,15 @@ docker compose up -d
   - 支持 `reasoning_effort`，会同时透传到 ZeroTwo 的顶层 `reasoning_effort` 与 `contextData.reasoning_effort`
   - 支持 `model` 写成 `openai/gpt-5.2`：会自动拆分为 `provider=openai`、`model=gpt-5.2` 转发给 ZeroTwo（也支持直接传 `provider` 字段）
   - `reasoning_effort` 默认值为 `high`
+  - `instructions` 默认值为 `You are a helpful assistant.`
   - 流式模式默认返回 `usage`（无需额外设置 `stream_options.include_usage`）
   - 当 `provider` 为 `anthropic`（或 `model` 形如 `anthropic/claude-...`）时，支持 Claude 风格 `thinking`：
     - `{"thinking":{"type":"off"}}` 关闭
     - `{"thinking":{"type":"enabled","budget_tokens":1024}}` 开启（budget 仅允许 `1024/4096/10000/16000`，其他数值会自动取最近）
-  - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）转成上游需要的数字预算（`1024/4096/10000/16000`，`0` 表示关闭），并同步写入顶层与 `contextData.reasoning_effort`
+  - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）归一化为上游需要的“数字预算或 `off`”，并同时写入顶层与 `contextData.reasoning_effort`；`thinking` 仅用于推导该值，不会透传给上游
   - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `label` 严格等于 `Pro` 的账号；否则按默认轮询选择
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
-  - `instructions` 优先级：`messages[].role=system` > 顶层 `instructions` > `metadata.instructions`
+  - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`；不支持 `metadata.instructions`
 
 ## 网页管理
 

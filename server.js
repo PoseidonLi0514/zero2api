@@ -73,9 +73,10 @@ function parseProviderModelFromOpenAIRequest(openaiReq) {
   let provider = typeof openaiReq?.provider === "string" ? openaiReq.provider.trim() : "openai";
   let model = requestedModelRaw || "gpt-5.2";
   if (requestedModelRaw.includes("/")) {
-    const [p, m] = requestedModelRaw.split("/", 2);
+    const [p, ...rest] = requestedModelRaw.split("/");
+    // 只取第一个分段作为 provider，其余原样拼回作为 model
     if (p) provider = p;
-    if (m) model = m;
+    if (rest.length) model = rest.join("/");
   }
   provider = normalizeProviderName(provider);
   return { provider, model };
@@ -118,17 +119,17 @@ function nearestAllowedNumber(value, allowed) {
 
 function budgetFromReasoningEffort(effort) {
   const e = String(effort ?? "").toLowerCase();
-  if (e === "none" || e === "off" || e === "disabled") return 0;
+  if (e === "none" || e === "off" || e === "disabled") return null;
   if (e === "low" || e === "minimal") return 1024;
   if (e === "medium") return 4096;
   return 16000; // high / 默认
 }
 
-function normalizeAnthropicBudgetTokens(value) {
+function normalizeAnthropicReasoningEffort(value) {
   if (value === null || value === undefined) return 16000;
 
   if (typeof value === "number") {
-    if (!Number.isFinite(value) || value <= 0) return 0;
+    if (!Number.isFinite(value) || value <= 0) return "off";
     return nearestAllowedNumber(value, ANTHROPIC_THINKING_BUDGETS) || 16000;
   }
 
@@ -136,35 +137,33 @@ function normalizeAnthropicBudgetTokens(value) {
     const s = value.trim();
     const lower = s.toLowerCase();
     if (!lower) return 16000;
-    if (lower === "off" || lower === "none" || lower === "disabled") return 0;
+    if (lower === "off" || lower === "none" || lower === "disabled") return "off";
 
     // 允许用户用字符串直接写预算数字：例如 "4096"
     if (/^\d+$/.test(lower)) {
       const n = Number(lower);
-      if (!Number.isFinite(n) || n <= 0) return 0;
+      if (!Number.isFinite(n) || n <= 0) return "off";
       return nearestAllowedNumber(n, ANTHROPIC_THINKING_BUDGETS) || 16000;
     }
 
     const mapped = budgetFromReasoningEffort(lower);
-    if (mapped <= 0) return 0;
+    if (!mapped) return "off";
     return nearestAllowedNumber(mapped, ANTHROPIC_THINKING_BUDGETS) || 16000;
   }
 
   return 16000;
 }
 
-function normalizeAnthropicThinking(inputThinking, fallbackEffort) {
+function normalizeAnthropicThinkingToReasoningEffort(inputThinking, fallbackEffort) {
   const raw = inputThinking && typeof inputThinking === "object" ? inputThinking : null;
   const rawType = raw?.type;
   const type = typeof rawType === "string" ? rawType.toLowerCase() : "";
   if (type === "off" || type === "disabled" || type === "none") {
-    return { thinking: { type: "off" }, budgetTokens: 0 };
+    return "off";
   }
 
   const requestedBudget = raw?.budget_tokens ?? raw?.budgetTokens;
-  const budget = normalizeAnthropicBudgetTokens(requestedBudget ?? fallbackEffort);
-  if (budget <= 0) return { thinking: { type: "off" }, budgetTokens: 0 };
-  return { thinking: { type: "enabled", budget_tokens: budget }, budgetTokens: budget };
+  return normalizeAnthropicReasoningEffort(requestedBudget ?? fallbackEffort);
 }
 
 function requireApiKey(req) {
@@ -624,11 +623,9 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
 
   const systemInstructions = systemParts.join("\n\n").trim();
   const topLevelInstructions = typeof openaiReq?.instructions === "string" ? openaiReq.instructions.trim() : "";
-  const metadataInstructions =
-    typeof openaiReq?.metadata?.instructions === "string" ? openaiReq.metadata.instructions.trim() : "";
-  const requestMetaInstructions = typeof requestMeta?.instructions === "string" ? requestMeta.instructions.trim() : "";
-  // 优先级：system messages > 顶层 instructions > metadata.instructions > requestMeta.instructions
-  const instructions = systemInstructions || topLevelInstructions || metadataInstructions || requestMetaInstructions;
+  // 你的代理主要接收 OpenAI 的 system messages：统一抽取并注入到 ZeroTwo 顶层 instructions。
+  // 不支持/忽略 metadata.instructions（无此入参约定）。
+  const instructions = systemInstructions || topLevelInstructions || "You are a helpful assistant.";
   const requestedEffort =
     openaiReq?.reasoning_effort ??
     openaiReq?.contextData?.reasoning_effort ??
@@ -637,20 +634,17 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
     "high";
   const normalizedProvider = normalizeProviderName(provider);
 
-  // OpenAI/ZeroTwo(OpenAI) 通道使用字符串 effort；Anthropic(Claude) 通道上游只接受数字 budget（0 表示 off）。
+  // 上游只使用 reasoning_effort：payload/contextData 两处保持一致。
+  // OpenAI/Gemini 上游支持字符串 high/medium/low；Anthropic(Claude) 上游支持数字预算或 off。
   let reasoningEffortValue = typeof requestedEffort === "string" ? requestedEffort : "high";
-  let anthropicThinking = null;
 
   if (normalizedProvider === "anthropic") {
-    // 1) 若用户提供 thinking，则按预算归一化；否则仅用 reasoning_effort 推导预算
+    // Claude: thinking 仅作为入参兼容，用于推导 reasoning_effort；不透传给上游。
     const providedThinking = openaiReq?.thinking && typeof openaiReq.thinking === "object" ? openaiReq.thinking : null;
     if (providedThinking) {
-      const normalized = normalizeAnthropicThinking(providedThinking, requestedEffort);
-      anthropicThinking = normalized.thinking;
-      reasoningEffortValue = normalized.budgetTokens;
+      reasoningEffortValue = normalizeAnthropicThinkingToReasoningEffort(providedThinking, requestedEffort);
     } else {
-      reasoningEffortValue = normalizeAnthropicBudgetTokens(requestedEffort);
-      if (reasoningEffortValue <= 0) anthropicThinking = { type: "off" };
+      reasoningEffortValue = normalizeAnthropicReasoningEffort(requestedEffort);
     }
   }
 
@@ -658,25 +652,26 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
     mode: { type: "thread", retrieval: null },
     active_app_id: null,
     active_mcp_server: null,
-    reasoning_effort: reasoningEffortValue,
     is_hybrid_reasoning: true
   };
 
   const contextData = {
     ...baseContextData,
-    ...(requestMeta?.contextData && typeof requestMeta.contextData === "object" ? requestMeta.contextData : {}),
-    reasoning_effort: reasoningEffortValue
+    ...(requestMeta?.contextData && typeof requestMeta.contextData === "object" ? requestMeta.contextData : {})
   };
+  // 上游同时读取 payload/contextData：强制对齐，防止 requestMeta 覆盖。
+  contextData.reasoning_effort = reasoningEffortValue;
 
   return {
     payload: {
+      // 注意：某些上游会对请求体做严格校验（甚至包含字段顺序）。
+      // 因此避免通过 spread 产生重复 key，确保 instructions 等关键字段位置稳定。
       provider,
       model,
       messages: zMessages,
       instructions,
       tool_choice: openaiReq?.tool_choice || "auto",
       reasoning_effort: reasoningEffortValue,
-      ...(anthropicThinking ? { thinking: anthropicThinking } : {}),
       contextData,
       featureId: "chat_stream",
       tracking: {
@@ -684,12 +679,7 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
         ...(threadId ? { threadId } : {}),
         requestId: randomId("req"),
         timestamp: new Date().toISOString()
-      },
-      ...(requestMeta && typeof requestMeta === "object" ? requestMeta : {}),
-      // 防止 requestMeta 覆盖掉我们强制对齐的字段
-      instructions,
-      reasoning_effort: reasoningEffortValue,
-      contextData
+      }
     }
   };
 }
@@ -786,7 +776,7 @@ async function handleChatCompletions(req, res) {
         openaiReq,
         account,
         {
-          // 兼容你的要求：把两个 reasoning_effort 都改掉（顶层 + contextData）
+          // 统一从 OpenAI 请求推导 reasoning_effort（最终只发送 payload.reasoning_effort）
           reasoning_effort: openaiReq?.reasoning_effort ?? "high"
         },
         threadId
