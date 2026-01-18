@@ -622,7 +622,13 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
     zMessages.push({ role: "assistant", content: "", id: crypto.randomUUID ? crypto.randomUUID() : randomId("msg") });
   }
 
-  const instructions = systemParts.join("\n\n");
+  const systemInstructions = systemParts.join("\n\n").trim();
+  const topLevelInstructions = typeof openaiReq?.instructions === "string" ? openaiReq.instructions.trim() : "";
+  const metadataInstructions =
+    typeof openaiReq?.metadata?.instructions === "string" ? openaiReq.metadata.instructions.trim() : "";
+  const requestMetaInstructions = typeof requestMeta?.instructions === "string" ? requestMeta.instructions.trim() : "";
+  // 优先级：system messages > 顶层 instructions > metadata.instructions > requestMeta.instructions
+  const instructions = systemInstructions || topLevelInstructions || metadataInstructions || requestMetaInstructions;
   const requestedEffort =
     openaiReq?.reasoning_effort ??
     openaiReq?.contextData?.reasoning_effort ??
@@ -681,6 +687,7 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
       },
       ...(requestMeta && typeof requestMeta === "object" ? requestMeta : {}),
       // 防止 requestMeta 覆盖掉我们强制对齐的字段
+      instructions,
       reasoning_effort: reasoningEffortValue,
       contextData
     }
