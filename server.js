@@ -38,7 +38,6 @@ const CONFIG = {
 };
 
 const ANTHROPIC_THINKING_BUDGETS = [1024, 4096, 10000, 16000];
-const RAG_UPLOAD_CONCURRENCY = Number(process.env.RAG_UPLOAD_CONCURRENCY || 2);
 
 function nowMs() {
   return Date.now();
@@ -82,38 +81,11 @@ function parseProviderModelFromOpenAIRequest(openaiReq) {
   return { provider, model };
 }
 
-function parseDataUrl(url) {
-  if (typeof url !== "string") return null;
-  if (!url.startsWith("data:")) return null;
-  const comma = url.indexOf(",");
-  if (comma === -1) return null;
-  const meta = url.slice(5, comma);
-  const data = url.slice(comma + 1);
-  const isBase64 = meta.endsWith(";base64");
-  const contentType = (isBase64 ? meta.slice(0, -";base64".length) : meta) || "application/octet-stream";
-  try {
-    const buf = isBase64 ? Buffer.from(data, "base64") : Buffer.from(decodeURIComponent(data), "utf8");
-    return { contentType, buffer: buf };
-  } catch {
-    return null;
-  }
-}
-
-function filenameFromContentType(contentType) {
-  const ct = String(contentType || "").toLowerCase();
-  if (ct === "image/png") return `upload-${Date.now()}.png`;
-  if (ct === "image/jpeg") return `upload-${Date.now()}.jpg`;
-  if (ct === "image/webp") return `upload-${Date.now()}.webp`;
-  if (ct === "application/pdf") return `upload-${Date.now()}.pdf`;
-  return `upload-${Date.now()}.bin`;
-}
-
-function extractTextAndUploadsFromMessageContent(content) {
-  if (typeof content === "string") return { text: content, uploads: [] };
-  if (!Array.isArray(content)) return { text: "", uploads: [] };
+function extractTextFromMessageContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
 
   let text = "";
-  const uploads = [];
 
   for (const part of content) {
     if (!part || typeof part !== "object") continue;
@@ -124,88 +96,9 @@ function extractTextAndUploadsFromMessageContent(content) {
       if (t) text += (text ? "\n" : "") + t;
       continue;
     }
-
-    if (type === "image_url" || type === "input_image") {
-      const url =
-        typeof part.image_url === "string"
-          ? part.image_url
-          : typeof part.image_url?.url === "string"
-            ? part.image_url.url
-            : typeof part.url === "string"
-              ? part.url
-              : "";
-      if (!url) continue;
-      uploads.push({ kind: "image", url });
-      continue;
-    }
   }
 
-  return { text, uploads };
-}
-
-async function fetchBytes(url, timeoutMs) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs || CONFIG.httpTimeoutMs);
-  try {
-    const res = await fetch(url, { signal: ac.signal });
-    if (!res.ok) throw new Error(`下载失败: ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    const contentType = res.headers.get("content-type") || "application/octet-stream";
-    return { buffer: buf, contentType };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function uploadToZeroTwoRag(account, { buffer, filename, contentType, threadId, userId, vectorStoreId, projectId }) {
-  const form = new FormData();
-  form.set("file", new Blob([buffer], { type: contentType }), filename);
-  form.set("filename", filename);
-  form.set("contentType", contentType);
-  form.set("userId", userId);
-  form.set("threadId", threadId);
-  if (typeof vectorStoreId === "string" && vectorStoreId.trim()) form.set("vectorStoreId", vectorStoreId.trim());
-  if (typeof projectId === "string" && projectId.trim()) form.set("projectId", projectId.trim());
-  form.set("attributes", "{}");
-  form.set("chunkingConfig", "{}");
-  form.set("processAsync", "true");
-
-  const url = `${CONFIG.zerotwoApiBase}/api/rag/upload`;
-  const doOnce = async () => {
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), CONFIG.httpTimeoutMs);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          accept: "*/*",
-          authorization: `Bearer ${account.accessToken}`,
-          origin: CONFIG.zerotwoOrigin,
-          referer: `${CONFIG.zerotwoOrigin}/`,
-          "x-csrf-token": account.security.csrfToken,
-          "x-signed-token": account.security.signedToken
-        },
-        body: form,
-        signal: ac.signal
-      });
-      const text = await res.text();
-      const parsed = safeJsonParse(text);
-      if (!res.ok) throw new Error(`RAG 上传失败: ${res.status} ${text.slice(0, 200)}`);
-      if (!parsed.ok) throw new Error(`RAG 上传返回非 JSON: ${text.slice(0, 200)}`);
-      if (!parsed.value?.success) throw new Error(`RAG 上传返回失败: ${text.slice(0, 200)}`);
-      return parsed.value?.data;
-    } finally {
-      clearTimeout(t);
-    }
-  };
-
-  try {
-    return await doOnce();
-  } catch (e) {
-    await refreshSupabaseSession(account);
-    await refreshSecurityTokens(account);
-    return await doOnce();
-  }
+  return text;
 }
 
 function nearestAllowedNumber(value, allowed) {
@@ -275,8 +168,6 @@ function requireApiKey(req) {
   return false;
 }
 
-const vectorStoreSingleflight = new Map();
-
 async function supabaseRestJson(account, pathAndQuery, { method, body, headers } = {}) {
   const url = `${CONFIG.supabaseBase}${pathAndQuery}`;
   const doOnce = async () => {
@@ -310,80 +201,6 @@ async function supabaseRestJson(account, pathAndQuery, { method, body, headers }
   }
   if (!r.ok) throw new Error(`Supabase REST 失败: ${r.status} ${r.text.slice(0, 200)}`);
   return r.json;
-}
-
-async function ensureThreadVectorStore(account, { threadId, provider }) {
-  if (!threadId) throw new Error("缺少 threadId");
-  const key = `${account.id}:${threadId}`;
-  const existing = vectorStoreSingleflight.get(key);
-  if (existing) return await existing;
-
-  const p = (async () => {
-    await ensureAccountReady(account);
-
-    const threadSel = encodeURIComponent("id,vector_store_id,rag_enabled");
-    let threadArr = await supabaseRestJson(account, `/rest/v1/threads?id=eq.${threadId}&select=${threadSel}`, {
-      method: "GET"
-    });
-    let threadRow = Array.isArray(threadArr) ? threadArr[0] : null;
-    const existingVs = threadRow?.vector_store_id;
-    if (typeof existingVs === "string" && existingVs) return existingVs;
-
-    if (!threadRow) {
-      // 创建 thread 占位
-      try {
-        await supabaseRestJson(account, "/rest/v1/threads?select=id", {
-          method: "POST",
-          headers: { prefer: "return=representation" },
-          body: {
-            id: threadId,
-            title: "New Chat",
-            user_id: account.userId || account.id,
-            provider: provider || "openai",
-            is_team: false,
-            is_shared: false
-          }
-        });
-      } catch {
-        // 可能并发创建冲突，忽略
-      }
-
-      threadArr = await supabaseRestJson(account, `/rest/v1/threads?id=eq.${threadId}&select=${threadSel}`, { method: "GET" });
-      threadRow = Array.isArray(threadArr) ? threadArr[0] : null;
-    }
-
-    const existingVs2 = threadRow?.vector_store_id;
-    if (typeof existingVs2 === "string" && existingVs2) return existingVs2;
-
-    // 创建 vector store（RPC）
-    const rpcRes = await supabaseRestJson(account, "/rest/v1/rpc/create_vector_store", {
-      method: "POST",
-      body: {
-        p_user_id: account.userId || account.id,
-        p_thread_id: threadId,
-        p_name: `Thread: ${threadId}`,
-        p_description: "Created by proxy"
-      }
-    });
-    const storeId = Array.isArray(rpcRes) ? rpcRes[0]?.id : rpcRes?.id;
-    if (typeof storeId !== "string" || !storeId) throw new Error("create_vector_store 未返回 id");
-
-    // 绑定到 thread
-    await supabaseRestJson(account, `/rest/v1/threads?id=eq.${threadId}`, {
-      method: "PATCH",
-      headers: { prefer: "return=representation" },
-      body: { vector_store_id: storeId, rag_enabled: true }
-    });
-
-    return storeId;
-  })();
-
-  vectorStoreSingleflight.set(key, p);
-  try {
-    return await p;
-  } finally {
-    vectorStoreSingleflight.delete(key);
-  }
 }
 
 function sendJson(res, statusCode, body) {
@@ -773,13 +590,11 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
   const messages = Array.isArray(openaiReq?.messages) ? openaiReq.messages : [];
   const systemParts = [];
   const zMessages = [];
-  const pendingUploads = [];
   let lastNonSystemRole = "";
   for (const m of messages) {
     if (!m || typeof m !== "object") continue;
     const role = m.role;
-    const extracted = extractTextAndUploadsFromMessageContent(m.content);
-    const content = extracted.text;
+    const content = extractTextFromMessageContent(m.content);
     if (role === "system") {
       if (content) systemParts.push(content);
       continue;
@@ -787,7 +602,6 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
     if (!role) continue;
     lastNonSystemRole = String(role);
     zMessages.push({ role, content, id: normalizeMessageId(m.id) });
-    for (const u of extracted.uploads) pendingUploads.push(u);
   }
 
   // ZeroTwo 的前端会在最后附加一个空 assistant（用于承载流式输出的 messageId）。
@@ -860,8 +674,7 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
       // 防止 requestMeta 覆盖掉我们强制对齐的字段
       reasoning_effort: reasoningEffortValue,
       contextData
-    },
-    pendingUploads
+    }
   };
 }
 
@@ -879,56 +692,6 @@ function getProvidedThreadIdFromRequest(openaiReq) {
 
 function buildThreadIdFromRequest(openaiReq) {
   return getProvidedThreadIdFromRequest(openaiReq) || (crypto.randomUUID ? crypto.randomUUID() : randomId("thread"));
-}
-
-function normalizeZeroTwoAttachment(uploadData) {
-  const fileId = uploadData?.fileId || uploadData?.file_id || uploadData?.id;
-  return {
-    id: fileId,
-    fileId,
-    file_id: fileId,
-    name: uploadData?.name || "",
-    type: uploadData?.type || uploadData?.contentType || "",
-    size: Number(uploadData?.size || 0),
-    path: uploadData?.path || "",
-    publicUrl: uploadData?.publicUrl || uploadData?.public_url || "",
-    storage_path: uploadData?.path || "",
-    bucket: uploadData?.bucket || "chat",
-    vector_store_id: uploadData?.vectorStoreId || uploadData?.vector_store_id || "",
-    vectorStoreId: uploadData?.vectorStoreId || uploadData?.vector_store_id || "",
-    threadId: uploadData?.threadId || "",
-    userId: uploadData?.userId || ""
-  };
-}
-
-function getRequestedAttachmentsFromOpenAIRequest(openaiReq) {
-  const a1 = openaiReq?.attachments;
-  if (Array.isArray(a1)) return a1;
-  const a2 = openaiReq?.metadata?.attachments;
-  if (Array.isArray(a2)) return a2;
-  return [];
-}
-
-function sanitizeRequestedAttachments(rawAttachments, { threadId, userId }) {
-  const out = [];
-  for (const a of rawAttachments) {
-    if (!a || typeof a !== "object") continue;
-    const normalized = normalizeZeroTwoAttachment(a);
-    if (normalized.userId && userId && normalized.userId !== userId) {
-      const err = new Error(`attachments.userId 与当前账号不匹配: ${normalized.userId} !== ${userId}`);
-      err.code = "BAD_ATTACHMENTS";
-      throw err;
-    }
-    if (normalized.threadId && threadId && normalized.threadId !== threadId) {
-      const err = new Error(`attachments.threadId 与请求 threadId 不匹配: ${normalized.threadId} !== ${threadId}`);
-      err.code = "BAD_ATTACHMENTS";
-      throw err;
-    }
-    if (!normalized.userId && userId) normalized.userId = userId;
-    if (!normalized.threadId && threadId) normalized.threadId = threadId;
-    out.push(normalized);
-  }
-  return out;
 }
 
 async function getExistingThreadVectorStoreId(account, threadId) {
@@ -1014,13 +777,6 @@ async function handleChatCompletions(req, res) {
       );
       const payload = plan.payload;
 
-      const userId = account.userId || account.id;
-      const projectIdHint =
-        typeof openaiReq?.metadata?.projectId === "string"
-          ? openaiReq.metadata.projectId
-          : typeof openaiReq?.metadata?.project_id === "string"
-            ? openaiReq.metadata.project_id
-            : "";
       let vectorStoreIdHint =
         typeof openaiReq?.metadata?.vectorStoreId === "string"
           ? openaiReq.metadata.vectorStoreId
@@ -1028,81 +784,8 @@ async function handleChatCompletions(req, res) {
             ? openaiReq.metadata.vector_store_id
             : "";
 
-      // 允许用户在 OpenAI 请求里直接透传 ZeroTwo 的 attachments（用于“先 curl 上传，再走代理聊天”的纯后端流程）。
-      // 支持：openaiReq.attachments / openaiReq.metadata.attachments
-      const requestedAttachments = getRequestedAttachmentsFromOpenAIRequest(openaiReq);
-      const attachments = sanitizeRequestedAttachments(requestedAttachments, { threadId, userId });
-
-      const firstVsFromAttachments = attachments.find((a) => a.vectorStoreId)?.vectorStoreId || "";
-      if (!vectorStoreIdHint && firstVsFromAttachments) vectorStoreIdHint = firstVsFromAttachments;
-
-      if (plan.pendingUploads.length) {
-        if (!vectorStoreIdHint) {
-          vectorStoreIdHint = await ensureThreadVectorStore(account, { threadId, provider: payload.provider });
-        }
-        const uploads = plan.pendingUploads.slice();
-
-        let idx = 0;
-        const workers = Array.from({ length: Math.max(1, RAG_UPLOAD_CONCURRENCY) }, () =>
-          (async () => {
-            for (;;) {
-              const my = idx++;
-              if (my >= uploads.length) return;
-              const u = uploads[my];
-              const url = u?.url;
-              if (typeof url !== "string" || !url) continue;
-
-              const dataUrl = parseDataUrl(url);
-              let buffer, contentType;
-              if (dataUrl) {
-                buffer = dataUrl.buffer;
-                contentType = dataUrl.contentType;
-              } else {
-                const fetched = await fetchBytes(url, CONFIG.httpTimeoutMs);
-                buffer = fetched.buffer;
-                contentType = fetched.contentType;
-              }
-              const filename = filenameFromContentType(contentType);
-              let uploaded;
-              try {
-                uploaded = await uploadToZeroTwoRag(account, {
-                  buffer,
-                  filename,
-                  contentType,
-                  threadId,
-                  userId,
-                  vectorStoreId: vectorStoreIdHint,
-                  projectId: projectIdHint
-                });
-              } catch (e) {
-                const msg = String(e?.message || e);
-                if (msg.includes("Could not resolve vector store")) {
-                  vectorStoreIdHint = await ensureThreadVectorStore(account, { threadId, provider: payload.provider });
-                  uploaded = await uploadToZeroTwoRag(account, {
-                    buffer,
-                    filename,
-                    contentType,
-                    threadId,
-                    userId,
-                    vectorStoreId: vectorStoreIdHint,
-                    projectId: projectIdHint
-                  });
-                } else {
-                  throw e;
-                }
-              }
-              attachments.push(normalizeZeroTwoAttachment(uploaded));
-            }
-          })()
-        );
-        await Promise.all(workers);
-      }
-
-      if (attachments.length) payload.attachments = attachments;
-
-      // 对齐 ZeroTwo 网页端：当 thread 已有关联的向量库（或携带 attachments）时，开启 thread 检索。
-      let effectiveVs =
-        attachments.find((a) => a.vectorStoreId)?.vectorStoreId || vectorStoreIdHint || "";
+      // 若用户指定了 vector store 或使用已有 thread，则开启 thread 检索。
+      let effectiveVs = vectorStoreIdHint || "";
       if (!effectiveVs && providedThreadId) {
         // 仅“读取”现有 thread 的向量库；不在没有上传的情况下自动创建，避免无意写库。
         effectiveVs = await getExistingThreadVectorStoreId(account, threadId);
@@ -1168,8 +851,7 @@ async function handleChatCompletions(req, res) {
       markSuccess(account);
       return result;
     } catch (e) {
-      // 客户端参数错误不应计入账号失败（否则会导致无意义熔断）
-      if (e?.code !== "BAD_ATTACHMENTS") markFailure(account, e);
+      markFailure(account, e);
       throw e;
     }
   });

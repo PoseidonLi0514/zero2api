@@ -9,8 +9,6 @@ services:
       PORT: 8787
       # 可选：控制 JSON 请求体大小（base64 图片会很大）
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-20971520}
-      # 可选：RAG 上传并发（避免同时上传太多导致抖动）
-      RAG_UPLOAD_CONCURRENCY: ${RAG_UPLOAD_CONCURRENCY:-2}
       # 默认已在代码写死；如未来变更可在这里覆盖
       # SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
     ports:
@@ -22,4 +20,3 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-
