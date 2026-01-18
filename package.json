@@ -1,0 +1,11 @@
+{
+  "name": "zero2api-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ZeroTwo -> OpenAI Chat Completions 兼容代理（多账号轮询 + Token 管理 + 网页管理）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+

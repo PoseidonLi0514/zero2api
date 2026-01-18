@@ -1,0 +1,51 @@
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsImtpZCI6Iitvbk1hNXdnUy9GVktyUHkiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2pkYmNldmpicWFveHJ4eHdxd3V4LnN1cGFiYXNlLmNvL2F1dGgvdjEiLCJzdWIiOiI0MTJkY2VkYy03NzEwLTQzY2QtODFmYi1mYTFiYzMwMjI3ZWQiLCJhdWQiOiJhdXRoZW50aWNhdGVkIiwiZXhwIjoxNzY4Njc2Njc1LCJpYXQiOjE3Njg2NzMwNzUsImVtYWlsIjoiYmFidWFyb2FtLm1zQGdtYWlsLmNvbSIsInBob25lIjoiIiwiYXBwX21ldGFkYXRhIjp7InByb3ZpZGVyIjoiZW1haWwiLCJwcm92aWRlcnMiOlsiZW1haWwiXX0sInVzZXJfbWV0YWRhdGEiOnsiZW1haWwiOiJiYWJ1YXJvYW0ubXNAZ21haWwuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsInBob25lX3ZlcmlmaWVkIjpmYWxzZSwic3ViIjoiNDEyZGNlZGMtNzcxMC00M2NkLTgxZmItZmExYmMzMDIyN2VkIn0sInJvbGUiOiJhdXRoZW50aWNhdGVkIiwiYWFsIjoiYWFsMSIsImFtciI6W3sibWV0aG9kIjoiZW1haWwvc2lnbnVwIiwidGltZXN0YW1wIjoxNzY4NjY5NDc5fV0sInNlc3Npb25faWQiOiJmOTA0NWEzMy0wNmVhLTQ4YjMtOTYyNC1jMTAzODA0YjZlMDEiLCJpc19hbm9ueW1vdXMiOmZhbHNlfQ.KZNsrOzUprzSSDsOwO_F36WHieSyo1nC_SRcDqvn-CA",
+    "token_type": "bearer",
+    "expires_in": 3600,
+    "expires_at": 1768676675,
+    "refresh_token": "lbxraqcobjqm",
+    "user": {
+        "id": "412dcedc-7710-43cd-81fb-fa1bc30227ed",
+        "aud": "authenticated",
+        "role": "authenticated",
+        "email": "babuaroam.ms@gmail.com",
+        "email_confirmed_at": "2026-01-17T17:04:35.350433Z",
+        "phone": "",
+        "confirmation_sent_at": "2026-01-17T17:04:18.526727Z",
+        "confirmed_at": "2026-01-17T17:04:35.350433Z",
+        "last_sign_in_at": "2026-01-17T17:04:39.725002Z",
+        "app_metadata": {
+            "provider": "email",
+            "providers": [
+                "email"
+            ]
+        },
+        "user_metadata": {
+            "email": "babuaroam.ms@gmail.com",
+            "email_verified": true,
+            "phone_verified": false,
+            "sub": "412dcedc-7710-43cd-81fb-fa1bc30227ed"
+        },
+        "identities": [
+            {
+                "identity_id": "b649d71b-2b44-4346-aace-ebc55bf29e08",
+                "id": "412dcedc-7710-43cd-81fb-fa1bc30227ed",
+                "user_id": "412dcedc-7710-43cd-81fb-fa1bc30227ed",
+                "identity_data": {
+                    "email": "babuaroam.ms@gmail.com",
+                    "email_verified": true,
+                    "phone_verified": false,
+                    "sub": "412dcedc-7710-43cd-81fb-fa1bc30227ed"
+                },
+                "provider": "email",
+                "last_sign_in_at": "2026-01-17T17:04:18.490399Z",
+                "created_at": "2026-01-17T17:04:18.490459Z",
+                "updated_at": "2026-01-17T17:04:18.490459Z",
+                "email": "babuaroam.ms@gmail.com"
+            }
+        ],
+        "created_at": "2026-01-17T17:04:18.299679Z",
+        "updated_at": "2026-01-17T18:04:35.670349Z",
+        "is_anonymous": false
+    }
+}
