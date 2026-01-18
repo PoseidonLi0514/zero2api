@@ -823,31 +823,6 @@ async function handleChatCompletions(req, res) {
         signal: ac.signal
       }).finally(() => clearTimeout(timeout));
 
-      // 认证类失败：做一次“自愈重试”（避免高并发抖动导致的短暂过期）
-      if (classifyAuthFailure(zRes.status)) {
-        await refreshSupabaseSession(account);
-        await refreshSecurityTokens(account);
-        const retryRes = await fetch(url, {
-          method: "POST",
-          headers: {
-            accept: "*/*",
-            authorization: `Bearer ${account.accessToken}`,
-            "content-type": "application/json",
-            origin: CONFIG.zerotwoOrigin,
-            referer: `${CONFIG.zerotwoOrigin}/`,
-            "x-csrf-token": account.security.csrfToken,
-            "x-signed-token": account.security.signedToken
-          },
-          body: JSON.stringify(payload),
-          signal: ac.signal
-        });
-        if (!retryRes.ok) {
-          const text = await retryRes.text();
-          throw new Error(`ZeroTwo 请求失败(重试): ${retryRes.status} ${text.slice(0, 200)}`);
-        }
-        return await streamZeroTwoToOpenAI(retryRes, openaiReq, res, { stream, includeUsage });
-      }
-
       if (!zRes.ok) {
         const text = await zRes.text();
         throw new Error(`ZeroTwo 请求失败: ${zRes.status} ${text.slice(0, 200)}`);
