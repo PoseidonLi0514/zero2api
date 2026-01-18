@@ -25,9 +25,9 @@ const CONFIG = {
 
   // 高并发下抖动控制：提前刷新 + 单飞互斥 + 熔断退避
   accessRefreshLeewayMs: 20 * 60 * 1000,
-  signedRefreshLeewayMs: 5 * 60 * 1000,
+  signedRefreshLeewayMs: 3 * 60 * 1000,
   csrfRefreshLeewayMs: 60 * 60 * 1000,
-  backgroundTickMs: 5 * 1000,
+  backgroundTickMs: 20 * 1000,
   backgroundMaxConcurrent: 4,
 
   // 账号级并发上限（可在网页里对单账号覆盖）
