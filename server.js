@@ -116,19 +116,41 @@ function nearestAllowedNumber(value, allowed) {
   return best;
 }
 
-function effortFromAnthropicBudget(budgetTokens) {
-  if (!budgetTokens) return "low";
-  if (budgetTokens <= 1024) return "low";
-  if (budgetTokens <= 4096) return "medium";
-  return "high";
-}
-
 function budgetFromReasoningEffort(effort) {
   const e = String(effort ?? "").toLowerCase();
-  if (e === "none" || e === "off" || e === "disabled") return null;
+  if (e === "none" || e === "off" || e === "disabled") return 0;
   if (e === "low" || e === "minimal") return 1024;
   if (e === "medium") return 4096;
   return 16000; // high / 默认
+}
+
+function normalizeAnthropicBudgetTokens(value) {
+  if (value === null || value === undefined) return 16000;
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return nearestAllowedNumber(value, ANTHROPIC_THINKING_BUDGETS) || 16000;
+  }
+
+  if (typeof value === "string") {
+    const s = value.trim();
+    const lower = s.toLowerCase();
+    if (!lower) return 16000;
+    if (lower === "off" || lower === "none" || lower === "disabled") return 0;
+
+    // 允许用户用字符串直接写预算数字：例如 "4096"
+    if (/^\d+$/.test(lower)) {
+      const n = Number(lower);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return nearestAllowedNumber(n, ANTHROPIC_THINKING_BUDGETS) || 16000;
+    }
+
+    const mapped = budgetFromReasoningEffort(lower);
+    if (mapped <= 0) return 0;
+    return nearestAllowedNumber(mapped, ANTHROPIC_THINKING_BUDGETS) || 16000;
+  }
+
+  return 16000;
 }
 
 function normalizeAnthropicThinking(inputThinking, fallbackEffort) {
@@ -136,22 +158,12 @@ function normalizeAnthropicThinking(inputThinking, fallbackEffort) {
   const rawType = raw?.type;
   const type = typeof rawType === "string" ? rawType.toLowerCase() : "";
   if (type === "off" || type === "disabled" || type === "none") {
-    return { thinking: { type: "off" }, budgetTokens: null };
+    return { thinking: { type: "off" }, budgetTokens: 0 };
   }
 
   const requestedBudget = raw?.budget_tokens ?? raw?.budgetTokens;
-  let budget = nearestAllowedNumber(requestedBudget, ANTHROPIC_THINKING_BUDGETS);
-  if (!budget) {
-    // fallbackEffort 允许是数字（直接指定 budget），也允许是字符串（high/medium/low/off）
-    const mapped =
-      typeof fallbackEffort === "number"
-        ? nearestAllowedNumber(fallbackEffort, ANTHROPIC_THINKING_BUDGETS)
-        : budgetFromReasoningEffort(fallbackEffort);
-    budget = mapped ? nearestAllowedNumber(mapped, ANTHROPIC_THINKING_BUDGETS) : null;
-  }
-  if (!budget) {
-    return { thinking: { type: "off" }, budgetTokens: null };
-  }
+  const budget = normalizeAnthropicBudgetTokens(requestedBudget ?? fallbackEffort);
+  if (budget <= 0) return { thinking: { type: "off" }, budgetTokens: 0 };
   return { thinking: { type: "enabled", budget_tokens: budget }, budgetTokens: budget };
 }
 
@@ -611,10 +623,15 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
   }
 
   const instructions = systemParts.join("\n\n");
-  const requestedEffort = openaiReq?.reasoning_effort ?? requestMeta?.reasoning_effort ?? "high";
+  const requestedEffort =
+    openaiReq?.reasoning_effort ??
+    openaiReq?.contextData?.reasoning_effort ??
+    requestMeta?.reasoning_effort ??
+    requestMeta?.contextData?.reasoning_effort ??
+    "high";
   const normalizedProvider = normalizeProviderName(provider);
 
-  // OpenAI/ZeroTwo(OpenAI) 通道使用字符串 effort；Anthropic 通道要求传数字 budget（或 off）。
+  // OpenAI/ZeroTwo(OpenAI) 通道使用字符串 effort；Anthropic(Claude) 通道上游只接受数字 budget（0 表示 off）。
   let reasoningEffortValue = typeof requestedEffort === "string" ? requestedEffort : "high";
   let anthropicThinking = null;
 
@@ -624,18 +641,10 @@ function buildZeroTwoPlanFromOpenAI(openaiReq, account, requestMeta, threadId) {
     if (providedThinking) {
       const normalized = normalizeAnthropicThinking(providedThinking, requestedEffort);
       anthropicThinking = normalized.thinking;
-      reasoningEffortValue = normalized.budgetTokens ? normalized.budgetTokens : "off";
+      reasoningEffortValue = normalized.budgetTokens;
     } else {
-      const asString = String(requestedEffort ?? "").toLowerCase();
-      if (asString === "off" || asString === "none" || asString === "disabled") {
-        reasoningEffortValue = "off";
-      } else if (typeof requestedEffort === "number") {
-        const n = nearestAllowedNumber(requestedEffort, ANTHROPIC_THINKING_BUDGETS);
-        reasoningEffortValue = n || 16000;
-      } else {
-        const mapped = budgetFromReasoningEffort(requestedEffort);
-        reasoningEffortValue = nearestAllowedNumber(mapped, ANTHROPIC_THINKING_BUDGETS) || 16000;
-      }
+      reasoningEffortValue = normalizeAnthropicBudgetTokens(requestedEffort);
+      if (reasoningEffortValue <= 0) anthropicThinking = { type: "off" };
     }
   }
 

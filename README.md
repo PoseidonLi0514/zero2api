@@ -58,7 +58,7 @@ docker compose up -d
   - 当 `provider` 为 `anthropic`（或 `model` 形如 `anthropic/claude-...`）时，支持 Claude 风格 `thinking`：
     - `{"thinking":{"type":"off"}}` 关闭
     - `{"thinking":{"type":"enabled","budget_tokens":1024}}` 开启（budget 仅允许 `1024/4096/10000/16000`，其他数值会自动取最近）
-  - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort` 转成上游需要的数字预算（`1024/4096/10000/16000`，或 `off`），并同步写入顶层与 `contextData.reasoning_effort`
+  - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）转成上游需要的数字预算（`1024/4096/10000/16000`，`0` 表示关闭），并同步写入顶层与 `contextData.reasoning_effort`
   - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `label` 严格等于 `Pro` 的账号；否则按默认轮询选择
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
 
