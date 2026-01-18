@@ -8,7 +8,7 @@ const { Readable } = require("node:stream");
 
 const CONFIG = {
   port: Number(process.env.PORT || 8787),
-  host: process.env.HOST || "127.0.0.1",
+  host: process.env.HOST || "0.0.0.0",
   apiKey: process.env.API_KEY || "change-me",
   dataDir: process.env.DATA_DIR || path.join(__dirname, "data"),
   accountsFile: process.env.ACCOUNTS_FILE || path.join(__dirname, "data", "accounts.json"),
@@ -27,8 +27,14 @@ const CONFIG = {
   accessRefreshLeewayMs: 20 * 60 * 1000,
   signedRefreshLeewayMs: 3 * 60 * 1000,
   csrfRefreshLeewayMs: 60 * 60 * 1000,
+  // 当触发“authentication rate limit”时，Security 刷新冷却时间（避免 20s 频率加重限流）
+  auth429SecurityCooldownMs: 10 * 60 * 1000,
+  auth429SecurityCooldownJitterMinMs: 5 * 1000,
+  auth429SecurityCooldownJitterMaxMs: 30 * 1000,
   backgroundTickMs: 20 * 1000,
-  backgroundMaxConcurrent: 4,
+  // 后台刷新节流：每轮最多处理 4 个账号、并发最多 2
+  backgroundGroupSize: 4,
+  backgroundMaxConcurrent: 2,
 
   // 账号级并发上限（可在网页里对单账号覆盖）
   defaultMaxInflightPerAccount: 8,
@@ -47,11 +53,33 @@ function sha256Base64Url(input) {
   return crypto.createHash("sha256").update(input).digest("base64url");
 }
 
+function randIntInclusive(min, max) {
+  const a = Math.ceil(Number(min));
+  const b = Math.floor(Number(max));
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  if (b <= a) return a;
+  return a + Math.floor(Math.random() * (b - a + 1));
+}
+
 function safeJsonParse(text) {
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch (e) {
     return { ok: false, error: String(e) };
+  }
+}
+
+function parseJwtPayload(token) {
+  const t = typeof token === "string" ? token.trim() : "";
+  if (!t) return null;
+  const parts = t.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const json = Buffer.from(parts[1], "base64url").toString("utf8");
+    const parsed = safeJsonParse(json);
+    return parsed.ok ? parsed.value : null;
+  } catch {
+    return null;
   }
 }
 
@@ -287,6 +315,7 @@ class TokenStore {
       securityMutex: createMutex(),
       inflight: 0,
       circuitUntilMs: 0,
+      authSecurityCooldownUntilMs: 0,
       lastError: null,
       consecutiveFailures: 0
     });
@@ -300,7 +329,24 @@ class TokenStore {
       const list = Array.isArray(parsed.value?.accounts) ? parsed.value.accounts : [];
       for (const a of list) {
         if (!a?.id || typeof a?.refreshToken !== "string") continue;
-        this.accounts.set(a.id, a);
+        const jwt = !a.email && a.accessToken ? parseJwtPayload(a.accessToken) : null;
+        const jwtEmail =
+          (typeof jwt?.email === "string" ? jwt.email : "") ||
+          (typeof jwt?.user_metadata?.email === "string" ? jwt.user_metadata.email : "") ||
+          "";
+        const normalized = {
+          id: a.id,
+          email: typeof a.email === "string" ? a.email : jwtEmail,
+          isPro: Boolean(a.isPro || a.label === "Pro"),
+          disabled: Boolean(a.disabled),
+          userId: a.userId || "",
+          refreshToken: a.refreshToken,
+          accessToken: a.accessToken || "",
+          accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
+          security: a.security || null,
+          maxInflight: Number(a.maxInflight || 0)
+        };
+        this.accounts.set(a.id, normalized);
       }
     } catch (e) {
       if (String(e).includes("ENOENT")) return;
@@ -312,7 +358,8 @@ class TokenStore {
     await this._saveMutex.run(async () => {
       const accounts = [...this.accounts.values()].map((a) => ({
         id: a.id,
-        label: a.label || "",
+        email: a.email || "",
+        isPro: Boolean(a.isPro),
         disabled: Boolean(a.disabled),
         userId: a.userId || "",
         refreshToken: a.refreshToken,
@@ -328,19 +375,31 @@ class TokenStore {
 
   list() {
     const out = [];
+    const now = nowMs();
     for (const a of this.accounts.values()) {
       const rt = this.runtime.get(a.id) || {};
+      const jwt = !a.email && a.accessToken ? parseJwtPayload(a.accessToken) : null;
+      const email =
+        a.email ||
+        (typeof jwt?.email === "string" ? jwt.email : "") ||
+        (typeof jwt?.user_metadata?.email === "string" ? jwt.user_metadata.email : "") ||
+        "";
+      const circuitUntilMs = Number(rt.circuitUntilMs || 0);
+      const inCircuit = circuitUntilMs > now;
+      const authSecurityCooldownUntilMs = Number(rt.authSecurityCooldownUntilMs || 0);
       out.push({
         id: a.id,
-        label: a.label || "",
+        email,
+        isPro: Boolean(a.isPro),
         disabled: Boolean(a.disabled),
         userId: a.userId || "",
         accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
         signedExpiresAtMs: Number(a.security?.signedExpiresAtMs || 0),
         csrfExpiresAtMs: Number(a.security?.csrfExpiresAtMs || 0),
         inflight: Number(rt.inflight || 0),
-        circuitUntilMs: Number(rt.circuitUntilMs || 0),
-        lastError: rt.lastError || null,
+        circuitUntilMs,
+        authSecurityCooldownUntilMs,
+        lastError: inCircuit ? rt.lastError || null : null,
         consecutiveFailures: Number(rt.consecutiveFailures || 0),
         maxInflight: Number(a.maxInflight || 0) || CONFIG.defaultMaxInflightPerAccount
       });
@@ -356,14 +415,23 @@ class TokenStore {
     }
     const id = appSession?.user?.id || randomId("acct");
     const userId = appSession?.user?.id || "";
+    const email =
+      appSession?.user?.email ||
+      appSession?.user?.user_metadata?.email ||
+      appSession?.user?.user_metadata?.mail ||
+      "";
     const accessToken = appSession?.access_token || "";
     const accessExpiresAtSec = Number(appSession?.expires_at || 0);
     const accessExpiresAtMs = accessExpiresAtSec > 0 ? accessExpiresAtSec * 1000 : 0;
 
     const existing = this.accounts.get(id);
+    const jwt = !email && accessToken ? parseJwtPayload(accessToken) : null;
+    const jwtEmail =
+      (typeof jwt?.email === "string" ? jwt.email : "") || (typeof jwt?.user_metadata?.email === "string" ? jwt.user_metadata.email : "");
     const account = {
       id,
-      label: existing?.label || "",
+      email: email || jwtEmail || existing?.email || "",
+      isPro: Boolean(existing?.isPro),
       disabled: false,
       userId,
       refreshToken,
@@ -415,6 +483,27 @@ function classifyAuthFailure(status) {
   return status === 401 || status === 403;
 }
 
+function isAuthRateLimit429(status, text) {
+  if (status !== 429) return false;
+  const raw = String(text || "");
+  const lower = raw.toLowerCase();
+  // 仅当明确是“认证限流”时才跳过熔断；普通 rate limit 仍按失败处理
+  if (lower.includes("authentication rate limit")) return true;
+  const parsed = safeJsonParse(raw);
+  if (!parsed.ok) return false;
+  const err = parsed.value?.error;
+  const msg = typeof err === "string" ? err : String(err?.message || err?.error || parsed.value?.message || parsed.value?.error || "");
+  const msgLower = msg.toLowerCase();
+  return msgLower.includes("authentication rate limit");
+}
+
+function shouldSkipCircuitBreak(error) {
+  if (error?.skipCircuitBreak) return true;
+  const status = Number(error?.status || 0);
+  const raw = String(error?.body || error?.message || error || "");
+  return isAuthRateLimit429(status, raw);
+}
+
 async function fetchJson(url, { method, headers, body, timeoutMs }) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs || CONFIG.httpTimeoutMs);
@@ -439,6 +528,48 @@ async function fetchJson(url, { method, headers, body, timeoutMs }) {
   }
 }
 
+function createUpstreamHttpError(prefix, res) {
+  const message = `${prefix}: ${res?.status || 0} ${String(res?.text || "").slice(0, 200)}`;
+  const err = new Error(message);
+  err.status = Number(res?.status || 0);
+  err.body = String(res?.text || "");
+  err.json = res?.json ?? null;
+  return err;
+}
+
+function extractErrorCode(error) {
+  const code = error?.json?.code || error?.json?.error?.code;
+  if (typeof code === "string" && code) return code;
+  const parsed = safeJsonParse(String(error?.body || ""));
+  if (!parsed.ok) return "";
+  const code2 = parsed.value?.code || parsed.value?.error?.code;
+  return typeof code2 === "string" ? code2 : "";
+}
+
+function summarizeCircuitReason(error) {
+  const status = Number(error?.status || 0);
+  const code = extractErrorCode(error);
+  const raw = String(error?.body || error?.message || "");
+  const lower = raw.toLowerCase();
+
+  if (status === 429) {
+    const suffix = code ? `, ${code}` : "";
+    if (isAuthRateLimit429(status, raw)) return `触发认证限流（429${suffix}）`;
+    return `触发限流（429${suffix}）`;
+  }
+  if (status === 401 || status === 403) return `认证失败（${status}）`;
+  if (lower.includes("abort") || lower.includes("timeout")) return "请求超时/中止";
+
+  const msg = String(error?.message || error || "").trim();
+  if (msg) return msg.length > 140 ? `${msg.slice(0, 140)}…` : msg;
+  return "未知错误";
+}
+
+function computeAuthSecurityCooldownUntilMs() {
+  const jitter = randIntInclusive(CONFIG.auth429SecurityCooldownJitterMinMs, CONFIG.auth429SecurityCooldownJitterMaxMs);
+  return nowMs() + CONFIG.auth429SecurityCooldownMs + jitter;
+}
+
 async function refreshSupabaseSession(account) {
   return await store.runtimeState(account.id).refreshMutex.run(async () => {
     const now = nowMs();
@@ -457,7 +588,7 @@ async function refreshSupabaseSession(account) {
       body: { refresh_token: account.refreshToken }
     });
     if (!res.ok) {
-      throw new Error(`Supabase 刷新失败: ${res.status} ${res.text.slice(0, 200)}`);
+      throw createUpstreamHttpError("Supabase 刷新失败", res);
     }
     const accessToken = res.json?.access_token;
     const refreshToken = res.json?.refresh_token;
@@ -499,7 +630,13 @@ async function refreshSecurityTokens(account) {
       body: null
     });
     if (!res.ok || !res.json?.success) {
-      throw new Error(`security-tokens 失败: ${res.status} ${res.text.slice(0, 200)}`);
+      const err = createUpstreamHttpError("security-tokens 失败", res);
+      if (isAuthRateLimit429(res.status, res.text)) {
+        const rt = store.runtimeState(account.id);
+        rt.authSecurityCooldownUntilMs = computeAuthSecurityCooldownUntilMs();
+        err.authSecurityCooldownUntilMs = rt.authSecurityCooldownUntilMs;
+      }
+      throw err;
     }
 
     const signedToken = res.json?.signedToken;
@@ -518,6 +655,7 @@ async function refreshSecurityTokens(account) {
       csrfExpiresAtMs: now + csrfTokenExpiresIn * 1000,
       fetchedAtMs: now
     };
+    store.runtimeState(account.id).authSecurityCooldownUntilMs = 0;
     await store.save();
     return { refreshed: true };
   });
@@ -539,20 +677,20 @@ async function ensureAccountReady(account) {
   }
 }
 
-function requiredLabelForProvider(provider) {
+function requiredProForProvider(provider) {
   const p = normalizeProviderName(provider);
-  // 你要求：标签严格匹配 "Pro"，并把 gemini/anthropic 自动引导到该 token
-  if (p === "gemini" || p === "anthropic") return "Pro";
-  return null;
+  // 你要求：gemini/anthropic 需要 Pro 账号
+  if (p === "gemini" || p === "anthropic") return true;
+  return false;
 }
 
-function pickAccount({ requiredLabel } = {}) {
+function pickAccount({ requiredPro } = {}) {
   const now = nowMs();
   const candidates = [];
   for (const a of store.accounts.values()) {
     const rt = store.runtimeState(a.id);
     if (a.disabled) continue;
-    if (requiredLabel && a.label !== requiredLabel) continue;
+    if (requiredPro && !a.isPro) continue;
     if (rt.circuitUntilMs && rt.circuitUntilMs > now) continue;
     const maxInflight = Number(a.maxInflight || 0) || CONFIG.defaultMaxInflightPerAccount;
     if (rt.inflight >= maxInflight) continue;
@@ -562,10 +700,10 @@ function pickAccount({ requiredLabel } = {}) {
   return candidates[0]?.a || null;
 }
 
-async function withAccount({ requiredLabel } = {}, fn) {
-  const account = pickAccount({ requiredLabel });
+async function withAccount({ requiredPro } = {}, fn) {
+  const account = pickAccount({ requiredPro });
   if (!account) {
-    const suffix = requiredLabel ? `（需要标签严格匹配: ${requiredLabel}）` : "";
+    const suffix = requiredPro ? "（需要 Pro 账号）" : "";
     const err = new Error(`暂无可用账号（可能全部熔断/并发已满/未导入）${suffix}`);
     err.code = "NO_ACCOUNT";
     throw err;
@@ -580,9 +718,10 @@ async function withAccount({ requiredLabel } = {}, fn) {
 }
 
 function markFailure(account, error, baseBackoffMs = 1000) {
+  if (shouldSkipCircuitBreak(error)) return;
   const rt = store.runtimeState(account.id);
   rt.consecutiveFailures += 1;
-  rt.lastError = String(error);
+  rt.lastError = summarizeCircuitReason(error);
   const jitter = Math.floor(Math.random() * 250);
   const backoff = Math.min(30_000, baseBackoffMs * Math.pow(2, Math.min(6, rt.consecutiveFailures - 1)));
   rt.circuitUntilMs = nowMs() + backoff + jitter;
@@ -764,9 +903,9 @@ async function handleChatCompletions(req, res) {
   const includeUsage = stream ? true : Boolean(openaiReq?.stream_options?.include_usage);
 
   const { provider } = parseProviderModelFromOpenAIRequest(openaiReq);
-  const requiredLabel = requiredLabelForProvider(provider);
+  const requiredPro = requiredProForProvider(provider);
 
-  return await withAccount({ requiredLabel }, async (account) => {
+  return await withAccount({ requiredPro }, async (account) => {
     try {
       const providedThreadId = getProvidedThreadIdFromRequest(openaiReq);
       const threadId = providedThreadId || (crypto.randomUUID ? crypto.randomUUID() : randomId("thread"));
@@ -823,14 +962,18 @@ async function handleChatCompletions(req, res) {
 
       if (!zRes.ok) {
         const text = await zRes.text();
-        throw new Error(`ZeroTwo 请求失败: ${zRes.status} ${text.slice(0, 200)}`);
+        const err = new Error(`ZeroTwo 请求失败: ${zRes.status} ${text.slice(0, 200)}`);
+        err.status = zRes.status;
+        err.body = text;
+        err.skipCircuitBreak = isAuthRateLimit429(zRes.status, text);
+        throw err;
       }
 
       const result = await streamZeroTwoToOpenAI(zRes, openaiReq, res, { stream, includeUsage });
       markSuccess(account);
       return result;
     } catch (e) {
-      markFailure(account, e);
+      if (!e?.skipCircuitBreak) markFailure(account, e);
       throw e;
     }
   });
@@ -973,167 +1116,20 @@ async function streamZeroTwoToOpenAI(zRes, openaiReq, res, { stream, includeUsag
   sendJson(res, 200, response);
 }
 
-function serveAdminHtml(res) {
-  const html = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ZeroTwo Token 管理</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 24px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    input, textarea, button { font: inherit; padding: 8px 10px; }
-    textarea { width: 100%; min-height: 140px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-    th, td { border-bottom: 1px solid rgba(127,127,127,0.35); padding: 10px 8px; text-align: left; vertical-align: top; }
-    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-    .muted { opacity: 0.8; }
-    .bad { color: #d33; }
-    .ok { color: #2a8; }
-  </style>
-</head>
-<body>
-  <h1>ZeroTwo Token 管理</h1>
-  <p class="muted">所有管理 API 与代理接口都需要 <code>x-api-key</code>（或 <code>Authorization: Bearer</code>）鉴权。</p>
+async function serveAdminAsset(res, filePath, contentType) {
+  try {
+    const body = await fsp.readFile(filePath);
+    res.writeHead(200, { "content-type": contentType, "cache-control": "no-cache" });
+    res.end(body);
+  } catch (e) {
+    res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Admin 资源加载失败");
+  }
+}
 
-  <div class="row">
-    <label>API Key：<input id="apiKey" placeholder="x-api-key" size="36" /></label>
-    <button id="saveKey">保存</button>
-    <button id="reload">刷新列表</button>
-  </div>
-
-  <h2>导入 app-session</h2>
-  <p class="muted">把浏览器 LocalStorage 里的 <code>app-session</code> JSON 整段粘贴进来即可（机器人账号场景）。</p>
-  <textarea id="appSession" placeholder='{"access_token":"...","refresh_token":"...","expires_at":...,"user":{"id":"..."}}'></textarea>
-  <div class="row">
-    <input id="label" placeholder="可选：标签（比如 bot-1）" />
-    <button id="import">导入</button>
-  </div>
-
-  <h2>账号列表</h2>
-  <div id="status" class="muted"></div>
-  <table>
-    <thead>
-      <tr>
-        <th>ID</th>
-        <th>标签</th>
-        <th>并发</th>
-        <th>Access 过期</th>
-        <th>Signed 过期</th>
-        <th>CSRF 过期</th>
-        <th>熔断</th>
-        <th>操作</th>
-      </tr>
-    </thead>
-    <tbody id="tbody"></tbody>
-  </table>
-
-  <script>
-    const apiKeyEl = document.getElementById("apiKey");
-    const statusEl = document.getElementById("status");
-    apiKeyEl.value = localStorage.getItem("zt_api_key") || "";
-    document.getElementById("saveKey").onclick = () => {
-      localStorage.setItem("zt_api_key", apiKeyEl.value.trim());
-      statusEl.textContent = "已保存 API Key。";
-    };
-    document.getElementById("reload").onclick = () => load();
-
-    function headers() {
-      const k = (apiKeyEl.value || "").trim();
-      return k ? {"x-api-key": k} : {};
-    }
-    function fmtTime(ms) {
-      if (!ms) return "-";
-      const d = new Date(ms);
-      return d.toLocaleString();
-    }
-    function fmtLeft(ms) {
-      if (!ms) return "";
-      const left = ms - Date.now();
-      const m = Math.floor(left / 60000);
-      if (m < 0) return "（已过期）";
-      if (m < 120) return \`（剩余 \${m} 分钟）\`;
-      const h = (left / 3600000).toFixed(1);
-      return \`（剩余 \${h} 小时）\`;
-    }
-
-    async function api(path, opts = {}) {
-      const res = await fetch(path, { ...opts, headers: { "content-type": "application/json", ...headers(), ...(opts.headers||{}) }});
-      const text = await res.text();
-      let json = null;
-      try { json = JSON.parse(text); } catch {}
-      if (!res.ok) throw new Error(json?.error?.message || text || res.statusText);
-      return json;
-    }
-
-    document.getElementById("import").onclick = async () => {
-      statusEl.textContent = "导入中...";
-      try {
-        const raw = document.getElementById("appSession").value.trim();
-        const label = document.getElementById("label").value.trim();
-        await api("/admin/api/accounts/import", { method: "POST", body: JSON.stringify({ appSession: raw, label }) });
-        statusEl.textContent = "导入成功。";
-        await load();
-      } catch (e) {
-        statusEl.textContent = "导入失败：" + e.message;
-      }
-    };
-
-    async function load() {
-      statusEl.textContent = "加载中...";
-      try {
-        const data = await api("/admin/api/accounts", { method: "GET", headers: headers() });
-        const tbody = document.getElementById("tbody");
-        tbody.innerHTML = "";
-        for (const a of data.accounts) {
-          const tr = document.createElement("tr");
-          tr.innerHTML = \`
-            <td><code>\${a.id}</code></td>
-            <td>\${a.label || ""}</td>
-            <td>\${a.inflight}/\${a.maxInflight}</td>
-            <td>\${fmtTime(a.accessExpiresAtMs)} <span class="muted">\${fmtLeft(a.accessExpiresAtMs)}</span></td>
-            <td>\${fmtTime(a.signedExpiresAtMs)} <span class="muted">\${fmtLeft(a.signedExpiresAtMs)}</span></td>
-            <td>\${fmtTime(a.csrfExpiresAtMs)} <span class="muted">\${fmtLeft(a.csrfExpiresAtMs)}</span></td>
-            <td>\${a.circuitUntilMs && a.circuitUntilMs > Date.now() ? "<span class='bad'>熔断中</span>" : "<span class='ok'>正常</span>"}<div class="muted">\${a.lastError ? a.lastError : ""}</div></td>
-            <td>
-              <div class="row">
-                <button data-act="forceAccess" data-id="\${a.id}">强制刷新 Access</button>
-                <button data-act="forceSecurity" data-id="\${a.id}">强制刷新 Security</button>
-                <button data-act="toggle" data-id="\${a.id}">\${a.disabled ? "启用" : "禁用"}</button>
-                <button data-act="del" data-id="\${a.id}">删除</button>
-              </div>
-            </td>
-          \`;
-          tbody.appendChild(tr);
-        }
-        tbody.querySelectorAll("button").forEach(btn => {
-          btn.onclick = async () => {
-            const id = btn.getAttribute("data-id");
-            const act = btn.getAttribute("data-act");
-            try {
-              if (act === "forceAccess") await api(\`/admin/api/accounts/\${id}/refresh-access\`, { method: "POST" });
-              if (act === "forceSecurity") await api(\`/admin/api/accounts/\${id}/refresh-security\`, { method: "POST" });
-              if (act === "toggle") await api(\`/admin/api/accounts/\${id}/toggle\`, { method: "POST" });
-              if (act === "del") await api(\`/admin/api/accounts/\${id}\`, { method: "DELETE" });
-              await load();
-            } catch (e) {
-              statusEl.textContent = "操作失败：" + e.message;
-            }
-          };
-        });
-        statusEl.textContent = "就绪。";
-      } catch (e) {
-        statusEl.textContent = "加载失败：" + e.message + "（请先填写正确的 API Key）";
-      }
-    }
-    load();
-  </script>
-</body>
-</html>`;
-  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-  res.end(html);
+async function serveAdminHtml(res) {
+  const filePath = path.join(__dirname, "admin", "index.html");
+  return await serveAdminAsset(res, filePath, "text/html; charset=utf-8");
 }
 
 async function handleAdminApi(req, res, url) {
@@ -1149,7 +1145,7 @@ async function handleAdminApi(req, res, url) {
     if (!parsed.ok) return sendJson(res, 400, { error: { message: "JSON 解析失败" } });
 
     const appSessionRaw = parsed.value?.appSession;
-    const label = parsed.value?.label;
+    const isPro = Boolean(parsed.value?.isPro);
     if (typeof appSessionRaw !== "string" || !appSessionRaw.trim()) {
       return sendJson(res, 400, { error: { message: "缺少 appSession" } });
     }
@@ -1157,9 +1153,19 @@ async function handleAdminApi(req, res, url) {
     if (!appSessionParsed.ok) return sendJson(res, 400, { error: { message: "app-session JSON 解析失败" } });
 
     const account = store.upsertFromAppSession(appSessionParsed.value);
-    if (typeof label === "string" && label.trim()) account.label = label.trim();
+    account.isPro = isPro;
     await store.save();
     return sendJson(res, 200, { ok: true, account: { id: account.id } });
+  }
+
+  const mTogglePro = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/toggle-pro$/);
+  if (req.method === "POST" && mTogglePro) {
+    const id = mTogglePro[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    a.isPro = !a.isPro;
+    await store.save();
+    return sendJson(res, 200, { ok: true, isPro: a.isPro });
   }
 
   const mToggle = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/toggle$/);
@@ -1210,8 +1216,34 @@ async function handleAdminApi(req, res, url) {
 async function backgroundTick() {
   const now = nowMs();
   const list = [...store.accounts.values()].filter((a) => !a.disabled);
-  // 简单的并发限制队列
-  const queue = list.slice();
+
+  const candidates = [];
+  for (const a of list) {
+    const rt = store.runtimeState(a.id);
+    if (rt.circuitUntilMs && rt.circuitUntilMs > now) continue;
+
+    const needAccess = !a.accessToken || a.accessExpiresAtMs - now <= CONFIG.accessRefreshLeewayMs;
+    const needSigned = !a.security?.signedToken || Number(a.security?.signedExpiresAtMs || 0) - now <= CONFIG.signedRefreshLeewayMs;
+    const needCsrf = !a.security?.csrfToken || Number(a.security?.csrfExpiresAtMs || 0) - now <= CONFIG.csrfRefreshLeewayMs;
+    const needSecurity = needSigned || needCsrf;
+    if (!needAccess && !needSecurity) continue;
+
+    if (needSecurity) {
+      const cooldownUntil = Number(rt.authSecurityCooldownUntilMs || 0);
+      if (cooldownUntil && cooldownUntil > now) continue;
+    }
+
+    const dueAccessAt = !a.accessToken ? -Infinity : Number(a.accessExpiresAtMs || 0) - CONFIG.accessRefreshLeewayMs;
+    const dueSignedAt = !a.security?.signedToken ? -Infinity : Number(a.security?.signedExpiresAtMs || 0) - CONFIG.signedRefreshLeewayMs;
+    const dueCsrfAt = !a.security?.csrfToken ? -Infinity : Number(a.security?.csrfExpiresAtMs || 0) - CONFIG.csrfRefreshLeewayMs;
+    const dueSecurityAt = Math.min(dueSignedAt, dueCsrfAt);
+    const dueAt = Math.min(needAccess ? dueAccessAt : Infinity, needSecurity ? dueSecurityAt : Infinity);
+
+    candidates.push({ a, dueAt });
+  }
+
+  candidates.sort((x, y) => x.dueAt - y.dueAt);
+  const queue = candidates.slice(0, CONFIG.backgroundGroupSize).map((x) => x.a);
   let active = 0;
   return await new Promise((resolve) => {
     const pump = () => {
@@ -1224,11 +1256,24 @@ async function backgroundTick() {
           const needAccess = !a.accessToken || a.accessExpiresAtMs - now <= CONFIG.accessRefreshLeewayMs;
           const needSigned = !a.security?.signedToken || Number(a.security?.signedExpiresAtMs || 0) - now <= CONFIG.signedRefreshLeewayMs;
           const needCsrf = !a.security?.csrfToken || Number(a.security?.csrfExpiresAtMs || 0) - now <= CONFIG.csrfRefreshLeewayMs;
-          if (!needAccess && !needSigned && !needCsrf) return;
+          const needSecurity = needSigned || needCsrf;
+          if (!needAccess && !needSecurity) return;
           try {
-            await ensureAccountReady(a);
+            // Access 与 Security 拆分：避免 Security 的 auth 429 导致 20s 频率反复重试。
+            if (needAccess) await refreshSupabaseSession(a);
+            if (needSecurity) {
+              const cooldownUntil = Number(rt.authSecurityCooldownUntilMs || 0);
+              if (cooldownUntil && cooldownUntil > nowMs()) return;
+              await refreshSecurityTokens(a);
+            }
             markSuccess(a);
           } catch (e) {
+            // 仅“authentication rate limit”类 429 设置冷却并跳过熔断；其余错误照常熔断退避。
+            const raw = String(e?.body || e?.message || e || "");
+            if (isAuthRateLimit429(Number(e?.status || 0), raw)) {
+              rt.authSecurityCooldownUntilMs = computeAuthSecurityCooldownUntilMs();
+              return;
+            }
             markFailure(a, e);
           }
         })()
@@ -1251,7 +1296,15 @@ async function main() {
       const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
       if (req.method === "GET" && url.pathname === "/healthz") return sendText(res, 200, "ok\n");
 
-      if (req.method === "GET" && url.pathname === "/admin") return serveAdminHtml(res);
+      if (req.method === "GET" && url.pathname === "/admin") return await serveAdminHtml(res);
+      if (req.method === "GET" && url.pathname === "/admin.css") {
+        const filePath = path.join(__dirname, "admin", "admin.css");
+        return await serveAdminAsset(res, filePath, "text/css; charset=utf-8");
+      }
+      if (req.method === "GET" && url.pathname === "/admin.js") {
+        const filePath = path.join(__dirname, "admin", "admin.js");
+        return await serveAdminAsset(res, filePath, "application/javascript; charset=utf-8");
+      }
       if (url.pathname.startsWith("/admin/api/")) return await handleAdminApi(req, res, url);
 
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
@@ -1276,8 +1329,15 @@ async function main() {
     if (CONFIG.apiKey === "change-me") console.log("[server] 警告：请设置环境变量 API_KEY");
   });
 
+  let backgroundRunning = false;
   setInterval(() => {
-    backgroundTick().catch(() => {});
+    if (backgroundRunning) return;
+    backgroundRunning = true;
+    backgroundTick()
+      .catch(() => {})
+      .finally(() => {
+        backgroundRunning = false;
+      });
   }, CONFIG.backgroundTickMs).unref();
 }
 

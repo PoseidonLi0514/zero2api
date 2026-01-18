@@ -50,7 +50,7 @@ docker compose up -d
     - `{"thinking":{"type":"off"}}` 关闭
     - `{"thinking":{"type":"enabled","budget_tokens":1024}}` 开启（budget 仅允许 `1024/4096/10000/16000`，其他数值会自动取最近）
   - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）归一化为上游需要的“数字预算或 `off`”，并同时写入顶层与 `contextData.reasoning_effort`；`thinking` 仅用于推导该值，不会透传给上游
-  - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `label` 严格等于 `Pro` 的账号；否则按默认轮询选择
+  - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `isPro=true` 的账号；否则按默认轮询选择
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
   - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`；不支持 `metadata.instructions`
 
@@ -60,10 +60,17 @@ docker compose up -d
 - 管理 API：
   - `GET /admin/api/accounts`
   - `POST /admin/api/accounts/import`
+  - `POST /admin/api/accounts/:id/toggle-pro`
   - `POST /admin/api/accounts/:id/refresh-access`
   - `POST /admin/api/accounts/:id/refresh-security`
   - `POST /admin/api/accounts/:id/toggle`
   - `DELETE /admin/api/accounts/:id`
+
+## 后台刷新策略（简述）
+
+- 后台定时任务默认每 `20s` 扫描一次需要刷新的账号（见 `BACKGROUND_TICK_MS`/`backgroundTickMs`）。
+- 后台每轮最多处理 `4` 个账号，并发最多 `2`，未处理的账号会等下一轮，降低“同一时刻扎堆刷新”的风险。
+- 当 Security 刷新遇到 `authentication rate limit` 的 429 时，会对该账号进入 `10min` 冷却期，并额外增加 `5-30s` 抖动，避免冷却结束后同一轮集中重试；其它 429 仍按熔断退避处理。
 
 ### 导入方式
 

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeroTwo 账号控制台</title>
+    <link rel="stylesheet" href="/admin.css" />
+    <script defer src="/admin.js"></script>
+  </head>
+  <body>
+    <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <div class="toast-inner">
+        <div class="toast-title" id="toastTitle">操作失败</div>
+        <div class="toast-message" id="toastMessage"></div>
+        <button class="toast-close" id="toastClose" type="button" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <main class="shell">
+      <header class="hero reveal" style="--delay: 0s">
+        <div class="card hero-text">
+          <p class="eyebrow">ZeroTwo 管控台</p>
+          <h1>账号运行态一眼可视</h1>
+          <p class="lead">
+            管理入口与代理接口均需要 <code>x-api-key</code>（或 <code>Authorization: Bearer</code>）
+            鉴权。
+          </p>
+        </div>
+        <div class="card hero-card">
+          <label class="field">
+            <span>API Key</span>
+            <div class="field-row">
+              <input id="apiKey" placeholder="x-api-key" spellcheck="false" />
+              <button class="btn primary" id="saveKey">保存</button>
+            </div>
+          </label>
+          <div class="field-row">
+            <button class="btn ghost" id="reload">刷新列表</button>
+            <span id="status" class="status muted">等待操作</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="card reveal" style="--delay: 0.12s">
+        <div class="section-head">
+          <div>
+            <h2>导入 app-session</h2>
+            <p class="muted">
+              直接粘贴浏览器 LocalStorage 内的 <code>app-session</code> JSON 整段即可（适合机器人账号）。
+            </p>
+          </div>
+          <label class="pill check">
+            <input id="isPro" type="checkbox" />
+            <span>标记为 Pro</span>
+          </label>
+        </div>
+        <textarea
+          id="appSession"
+          placeholder='{"access_token":"...","refresh_token":"...","expires_at":...,"user":{"id":"...","email":"..."}}'
+        ></textarea>
+        <div class="section-actions">
+          <button class="btn primary" id="import">导入账号</button>
+        </div>
+      </section>
+
+      <section class="card reveal" style="--delay: 0.24s">
+        <div class="section-head">
+          <div>
+            <h2>账号列表</h2>
+            <p class="muted">按最新状态展示账号可用性与熔断信息。</p>
+          </div>
+          <div class="stats">
+            <div class="stat">
+              <span class="stat-label">账号总数</span>
+              <span id="accountCount" class="stat-value">0</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">Pro</span>
+              <span id="proCount" class="stat-value">0</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>序号</th>
+                <th>ID</th>
+                <th>邮箱</th>
+                <th>类型</th>
+                <th>并发</th>
+                <th>Access 过期</th>
+                <th>Signed 过期</th>
+                <th>CSRF 过期</th>
+                <th>熔断</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
