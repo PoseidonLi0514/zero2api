@@ -768,8 +768,6 @@ async function handleChatCompletions(req, res) {
 
   return await withAccount({ requiredLabel }, async (account) => {
     try {
-      await ensureAccountReady(account);
-
       const providedThreadId = getProvidedThreadIdFromRequest(openaiReq);
       const threadId = providedThreadId || (crypto.randomUUID ? crypto.randomUUID() : randomId("thread"));
       const plan = buildZeroTwoPlanFromOpenAI(
