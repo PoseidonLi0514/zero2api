@@ -11,15 +11,6 @@ PORT=8787 \
 node server.js
 ```
 
-## 调试（排查 fetch failed）
-
-默认不输出详细调试日志（避免误把敏感信息打到日志里）。如需我加一个“仅本地可用”的调试开关，再说一声。
-
-如果你看到类似 `UND_ERR_CONNECT_TIMEOUT`，常见是 IPv6 “可解析但不可达”导致连接一直卡住。可以用以下方式排查/修复：
-
-- 让 Node 优先走 IPv4（本项目默认已设置；可用 `DNS_RESULT_ORDER=verbatim` 关闭）：`DNS_RESULT_ORDER=ipv4first node server.js`
-- 拉长连接建立超时（默认 20s）：`HTTP_CONNECT_TIMEOUT_MS=30000 node server.js`
-
 ## Docker / Docker Compose 部署
 
 在服务器上执行：
@@ -52,7 +43,7 @@ docker compose up -d
   - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）归一化为上游需要的“数字预算或 `off`”，并同时写入顶层与 `contextData.reasoning_effort`；`thinking` 仅用于推导该值，不会透传给上游
   - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `isPro=true` 的账号；否则按默认轮询选择
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
-  - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`；不支持 `metadata.instructions`
+  - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`
 
 ## 网页管理
 
