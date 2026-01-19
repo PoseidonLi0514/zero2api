@@ -686,7 +686,8 @@ function requiredProForProvider(provider) {
 
 function pickAccount({ requiredPro } = {}) {
   const now = nowMs();
-  const candidates = [];
+  let bestInflight = Infinity;
+  const best = [];
   for (const a of store.accounts.values()) {
     const rt = store.runtimeState(a.id);
     if (a.disabled) continue;
@@ -694,10 +695,19 @@ function pickAccount({ requiredPro } = {}) {
     if (rt.circuitUntilMs && rt.circuitUntilMs > now) continue;
     const maxInflight = Number(a.maxInflight || 0) || CONFIG.defaultMaxInflightPerAccount;
     if (rt.inflight >= maxInflight) continue;
-    candidates.push({ a, inflight: rt.inflight, maxInflight });
+
+    // 选择 inflight 最少的账号；若并列，则在并列集合里随机挑一个，避免低并发场景总是命中第一个账号。
+    if (rt.inflight < bestInflight) {
+      bestInflight = rt.inflight;
+      best.length = 0;
+      best.push(a);
+      continue;
+    }
+    if (rt.inflight === bestInflight) best.push(a);
   }
-  candidates.sort((x, y) => x.inflight - y.inflight);
-  return candidates[0]?.a || null;
+  if (!best.length) return null;
+  const idx = randInt(0, best.length - 1);
+  return best[idx] || null;
 }
 
 async function withAccount({ requiredPro } = {}, fn) {
