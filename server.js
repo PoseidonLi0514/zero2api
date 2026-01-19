@@ -883,15 +883,46 @@ function parseSseEventsFromTextChunk(state, chunkText, onEvent) {
 }
 
 function buildOpenAIUsageFromZeroTwoUsage(u) {
-  // ZeroTwo(OpenAI) 形态：prompt_tokens/completion_tokens/total_tokens/reasoning_tokens
-  // ZeroTwo(Anthropic) 形态：input_tokens/output_tokens (+ cache_* 等扩展字段)
-  const prompt_tokens = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0);
-  const completion_tokens = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
+  // 兼容 ZeroTwo(OpenAI) 与 ZeroTwo(Anthropic) 的 usage，并输出为 OpenAI Chat Completions 结构：
+  // usage.prompt_tokens / usage.completion_tokens / usage.total_tokens
+  // usage.prompt_tokens_details.cached_tokens / audio_tokens
+  // usage.completion_tokens_details.reasoning_tokens / audio_tokens / accepted_prediction_tokens / rejected_prediction_tokens
+  const prompt_tokens = Number(u?.prompt_tokens ?? u?.input_tokens ?? 0) || 0;
+  const completion_tokens = Number(u?.completion_tokens ?? u?.output_tokens ?? 0) || 0;
   const total_tokens = Number(u?.total_tokens || 0) || prompt_tokens + completion_tokens;
-  const reasoning_tokens = Number(u?.reasoning_tokens || 0);
-  const usage = { prompt_tokens, completion_tokens, total_tokens };
-  if (reasoning_tokens) usage.reasoning_tokens = reasoning_tokens;
-  return usage;
+
+  const reasoning_tokens =
+    Number(u?.completion_tokens_details?.reasoning_tokens ?? u?.reasoning_tokens ?? 0) || 0;
+  const cached_tokens =
+    Number(
+      u?.prompt_tokens_details?.cached_tokens ??
+        u?.cached_tokens ??
+        u?.cache_read_input_tokens ??
+        0
+    ) || 0;
+
+  const prompt_audio_tokens = Number(u?.prompt_tokens_details?.audio_tokens ?? 0) || 0;
+  const completion_audio_tokens = Number(u?.completion_tokens_details?.audio_tokens ?? 0) || 0;
+  const accepted_prediction_tokens =
+    Number(u?.completion_tokens_details?.accepted_prediction_tokens ?? 0) || 0;
+  const rejected_prediction_tokens =
+    Number(u?.completion_tokens_details?.rejected_prediction_tokens ?? 0) || 0;
+
+  return {
+    prompt_tokens,
+    completion_tokens,
+    total_tokens,
+    prompt_tokens_details: {
+      cached_tokens,
+      audio_tokens: prompt_audio_tokens
+    },
+    completion_tokens_details: {
+      reasoning_tokens,
+      audio_tokens: completion_audio_tokens,
+      accepted_prediction_tokens,
+      rejected_prediction_tokens
+    }
+  };
 }
 
 async function handleChatCompletions(req, res) {
