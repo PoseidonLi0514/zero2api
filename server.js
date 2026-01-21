@@ -706,7 +706,7 @@ function pickAccount({ requiredPro } = {}) {
     if (rt.inflight === bestInflight) best.push(a);
   }
   if (!best.length) return null;
-  const idx = randInt(0, best.length - 1);
+  const idx = randIntInclusive(0, best.length - 1);
   return best[idx] || null;
 }
 
