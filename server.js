@@ -13,6 +13,9 @@ const CONFIG = {
   dataDir: process.env.DATA_DIR || path.join(__dirname, "data"),
   accountsFile: process.env.ACCOUNTS_FILE || path.join(__dirname, "data", "accounts.json"),
   maxRequestBodyBytes: Number(process.env.MAX_REQUEST_BODY_BYTES || 20 * 1024 * 1024),
+  maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024),
+  imageProcessingWaitMs: Number(process.env.IMAGE_PROCESSING_WAIT_MS || 60 * 1000),
+  imageProcessingPollIntervalMs: Number(process.env.IMAGE_PROCESSING_POLL_INTERVAL_MS || 750),
 
   supabaseBase: "https://db.zerotwo.ai",
   // 你确认这是“公开 anon key”，可写死；如需替换，可用环境变量覆盖。
@@ -242,6 +245,18 @@ async function supabaseRestJson(account, pathAndQuery, { method, body, headers }
   return r.json;
 }
 
+async function supabasePublicJson(account, pathAndQuery, { method, body, headers } = {}) {
+  return await supabaseRestJson(account, pathAndQuery, {
+    method,
+    body,
+    headers: {
+      "content-profile": "public",
+      "accept-profile": "public",
+      ...(headers || {})
+    }
+  });
+}
+
 function sendJson(res, statusCode, body) {
   const payload = JSON.stringify(body);
   res.writeHead(statusCode, {
@@ -275,6 +290,318 @@ async function readBody(req, limitBytes = 2 * 1024 * 1024) {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+}
+
+function parseDataUrl(dataUrl) {
+  const raw = typeof dataUrl === "string" ? dataUrl : "";
+  if (!raw.startsWith("data:")) return null;
+  const m = raw.match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+  if (!m) return null;
+  const contentType = (m[1] || "application/octet-stream").trim();
+  const isBase64 = Boolean(m[2]);
+  const payload = m[3] || "";
+  try {
+    const buf = isBase64 ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8");
+    return { contentType, buffer: buf };
+  } catch {
+    return null;
+  }
+}
+
+function extFromContentType(contentType) {
+  const ct = String(contentType || "").toLowerCase();
+  if (ct === "image/png") return ".png";
+  if (ct === "image/jpeg") return ".jpg";
+  if (ct === "image/webp") return ".webp";
+  if (ct === "image/gif") return ".gif";
+  return "";
+}
+
+function sanitizeFilename(name) {
+  const raw = String(name || "").trim() || "upload";
+  const safe = raw.replace(/[^\w.\-]+/g, "_").slice(0, 120);
+  return safe || "upload";
+}
+
+function extractImageUrlsFromMessageContent(content) {
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const type = String(part.type || "").toLowerCase();
+    if (type !== "image_url" && type !== "input_image" && type !== "image") continue;
+
+    const candidate =
+      (typeof part.image_url === "string" ? part.image_url : "") ||
+      (typeof part.url === "string" ? part.url : "") ||
+      (typeof part.image === "string" ? part.image : "") ||
+      (typeof part.image_url?.url === "string" ? part.image_url.url : "") ||
+      (typeof part.image_url?.uri === "string" ? part.image_url.uri : "") ||
+      (typeof part.image?.url === "string" ? part.image.url : "") ||
+      "";
+    const url = candidate.trim();
+    if (url) out.push(url);
+  }
+  return out;
+}
+
+function extractImageUrlsFromOpenAIRequest(openaiReq) {
+  const msgs = Array.isArray(openaiReq?.messages) ? openaiReq.messages : [];
+  const out = [];
+  for (const m of msgs) {
+    if (!m || typeof m !== "object") continue;
+    out.push(...extractImageUrlsFromMessageContent(m.content));
+  }
+  return out;
+}
+
+function createBadAttachmentsError(message) {
+  const err = new Error(message);
+  err.code = "BAD_ATTACHMENTS";
+  return err;
+}
+
+async function fetchBuffer(url, { timeoutMs, maxBytes } = {}) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), Number(timeoutMs || CONFIG.httpTimeoutMs));
+  try {
+    const res = await fetch(url, { method: "GET", signal: ac.signal });
+    if (!res.ok) throw new Error(`下载失败: ${res.status}`);
+    const ab = await res.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const limit = Number(maxBytes || 0) || 0;
+    if (limit > 0 && buf.length > limit) throw new Error("文件过大");
+    const ct = res.headers.get("content-type") || "";
+    return { buffer: buf, contentType: ct };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function resolveImageToUploadBytes(imageUrl) {
+  const url = typeof imageUrl === "string" ? imageUrl.trim() : "";
+  if (!url) throw createBadAttachmentsError("图片 URL 为空");
+  const parsed = parseDataUrl(url);
+  if (parsed) {
+    if (parsed.buffer.length > CONFIG.maxUploadBytes) throw createBadAttachmentsError("图片过大");
+    return { buffer: parsed.buffer, contentType: parsed.contentType || "application/octet-stream" };
+  }
+  // 允许 http(s) 外链：用于 image_url.url = https://...
+  if (!/^https?:\/\//i.test(url)) {
+    throw createBadAttachmentsError("仅支持 data: 或 http(s) 图片 URL");
+  }
+  try {
+    const r = await fetchBuffer(url, { timeoutMs: CONFIG.httpTimeoutMs, maxBytes: CONFIG.maxUploadBytes });
+    return { buffer: r.buffer, contentType: r.contentType || "application/octet-stream" };
+  } catch (e) {
+    throw createBadAttachmentsError(`图片下载失败: ${String(e?.message || e)}`);
+  }
+}
+
+async function ensureThreadExists(account, threadId, { provider } = {}) {
+  const sel = encodeURIComponent("id,vector_store_id,rag_enabled");
+  const arr = await supabasePublicJson(account, `/rest/v1/threads?id=eq.${threadId}&select=${sel}`, { method: "GET" });
+  const row = Array.isArray(arr) ? arr[0] : null;
+  if (row?.id) return row;
+
+  const nowIso = new Date().toISOString();
+  // 对齐官方前端：创建 thread 记录，避免后续 vector store / upload 依赖 thread 不存在。
+  const created = await supabasePublicJson(account, "/rest/v1/threads?select=*", {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.pgrst.object+json",
+      prefer: "return=representation"
+    },
+    body: {
+      id: threadId,
+      title: "New Chat",
+      user_id: account.userId || account.id,
+      project_id: null,
+      metadata: { project_id: null, needs_title_generation: false },
+      created_at: nowIso,
+      updated_at: nowIso,
+      last_activity: nowIso,
+      provider: normalizeProviderName(provider || "openai"),
+      is_team: false,
+      is_shared: false
+    }
+  });
+  return created || { id: threadId, vector_store_id: null, rag_enabled: false };
+}
+
+async function ensureThreadVectorStore(account, threadId, { provider } = {}) {
+  const row = await ensureThreadExists(account, threadId, { provider });
+  const existing = typeof row?.vector_store_id === "string" ? row.vector_store_id : "";
+  if (existing) return existing;
+
+  const userId = account.userId || account.id;
+  const rpcRes = await supabasePublicJson(account, "/rest/v1/rpc/create_vector_store", {
+    method: "POST",
+    body: {
+      p_user_id: userId,
+      p_thread_id: threadId,
+      p_project_id: null,
+      p_name: `Thread: ${String(row?.title || "New Chat")}`,
+      p_description: `Vector store for thread ${threadId}`
+    }
+  });
+  const first = Array.isArray(rpcRes) ? rpcRes[0] : null;
+  const vectorStoreId = typeof first?.id === "string" ? first.id : "";
+  if (!vectorStoreId) throw new Error("create_vector_store 未返回 vectorStoreId");
+
+  await supabasePublicJson(account, `/rest/v1/threads?id=eq.${threadId}`, {
+    method: "PATCH",
+    headers: {
+      // 不强依赖返回值：与官方行为一致
+      prefer: "return=minimal"
+    },
+    body: { vector_store_id: vectorStoreId, rag_enabled: true }
+  });
+
+  return vectorStoreId;
+}
+
+async function uploadRagFile(account, { threadId, filename, contentType, buffer, processAsync } = {}) {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) throw createBadAttachmentsError("缺少图片文件内容");
+  if (buffer.length > CONFIG.maxUploadBytes) throw createBadAttachmentsError("图片过大");
+  const userId = account.userId || account.id;
+  const safeName = sanitizeFilename(filename || `upload${extFromContentType(contentType) || ".bin"}`);
+  const ct = String(contentType || "application/octet-stream");
+
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: ct }), safeName);
+  form.append("filename", safeName);
+  form.append("contentType", ct);
+  form.append("userId", userId);
+  form.append("threadId", threadId);
+  form.append("attributes", "{}");
+  form.append("chunkingConfig", "{}");
+  form.append("processAsync", processAsync === false ? "false" : "true");
+
+  const url = `${CONFIG.zerotwoApiBase}/api/rag/upload`;
+  const res = await fetchJson(url, {
+    method: "POST",
+    headers: {
+      accept: "*/*",
+      authorization: `Bearer ${account.accessToken}`,
+      origin: CONFIG.zerotwoOrigin,
+      referer: `${CONFIG.zerotwoOrigin}/`,
+      "x-csrf-token": account.security.csrfToken,
+      "x-signed-token": account.security.signedToken
+    },
+    body: form
+  });
+  if (!res.ok) throw createUpstreamHttpError("rag/upload 失败", res);
+  if (!res.json?.success || !res.json?.data) throw new Error("rag/upload 返回不完整");
+  return res.json;
+}
+
+async function getFileProcessingQueue(account, queueId) {
+  const sel = encodeURIComponent("status,processing_stage,processed_chunks,total_chunks,error_message");
+  return await supabasePublicJson(
+    account,
+    `/rest/v1/file_processing_queue?select=${sel}&id=eq.${encodeURIComponent(queueId)}`,
+    {
+      method: "GET",
+      headers: { accept: "application/vnd.pgrst.object+json" }
+    }
+  );
+}
+
+async function waitForFileProcessingCompletion(account, queueId, timeoutMs) {
+  const deadline = nowMs() + Math.max(0, Number(timeoutMs || 0));
+  let last = null;
+  while (nowMs() < deadline) {
+    const row = await getFileProcessingQueue(account, queueId);
+    last = row;
+    const status = String(row?.status || "").toLowerCase();
+    if (status === "completed" || status === "failed") return row;
+    await new Promise((r) => setTimeout(r, CONFIG.imageProcessingPollIntervalMs));
+  }
+  return last;
+}
+
+function buildZeroTwoAttachmentFromUploadData(d) {
+  const fileId = String(d?.fileId || d?.file_id || d?.id || "");
+  const name = String(d?.name || "");
+  return {
+    id: fileId,
+    fileId,
+    file_id: fileId,
+    name,
+    type: String(d?.type || d?.contentType || ""),
+    size: Number(d?.size || 0) || 0,
+    path: String(d?.path || ""),
+    publicUrl: String(d?.publicUrl || ""),
+    storage_path: String(d?.storage_path || d?.path || ""),
+    vector_store_id: String(d?.vector_store_id || d?.vectorStoreId || ""),
+    vectorStoreId: String(d?.vectorStoreId || d?.vector_store_id || ""),
+    threadId: String(d?.threadId || ""),
+    userId: String(d?.userId || "")
+  };
+}
+
+function parseMultipartFormData(body, contentTypeHeader) {
+  const ct = String(contentTypeHeader || "");
+  const m = ct.match(/boundary=([^;]+)/i);
+  const boundary = m ? m[1].trim().replace(/^"|"$/g, "") : "";
+  if (!boundary) throw new Error("缺少 multipart boundary");
+  const boundaryBuf = Buffer.from(`--${boundary}`);
+  const headerSep = Buffer.from("\r\n\r\n");
+  const crlf = Buffer.from("\r\n");
+
+  const fields = {};
+  const files = {};
+
+  let pos = 0;
+  for (;;) {
+    const start = body.indexOf(boundaryBuf, pos);
+    if (start === -1) break;
+    pos = start + boundaryBuf.length;
+    // 结束 boundary：--boundary--
+    if (body.slice(pos, pos + 2).toString() === "--") break;
+    // 跳过起始 CRLF
+    if (body.slice(pos, pos + 2).equals(crlf)) pos += 2;
+
+    const next = body.indexOf(boundaryBuf, pos);
+    if (next === -1) break;
+    const partBuf = body.slice(pos, next);
+    pos = next;
+
+    const headerEnd = partBuf.indexOf(headerSep);
+    if (headerEnd === -1) continue;
+    const headerText = partBuf.slice(0, headerEnd).toString("utf8");
+    let contentBuf = partBuf.slice(headerEnd + headerSep.length);
+    // 去掉结尾 CRLF
+    if (contentBuf.length >= 2 && contentBuf.slice(contentBuf.length - 2).equals(crlf)) {
+      contentBuf = contentBuf.slice(0, contentBuf.length - 2);
+    }
+
+    const headers = {};
+    for (const line of headerText.split(/\r?\n/)) {
+      const idx = line.indexOf(":");
+      if (idx === -1) continue;
+      const k = line.slice(0, idx).trim().toLowerCase();
+      const v = line.slice(idx + 1).trim();
+      headers[k] = v;
+    }
+    const cd = headers["content-disposition"] || "";
+    const nameM = cd.match(/name="([^"]+)"/i);
+    const filenameM = cd.match(/filename="([^"]*)"/i);
+    const name = nameM ? nameM[1] : "";
+    if (!name) continue;
+
+    const partCt = headers["content-type"] || "text/plain";
+    const filename = filenameM ? filenameM[1] : "";
+
+    if (filenameM) {
+      files[name] = { filename, contentType: partCt, buffer: contentBuf };
+    } else {
+      fields[name] = contentBuf.toString("utf8");
+    }
+  }
+
+  return { fields, files };
 }
 
 function createMutex() {
@@ -508,10 +835,18 @@ async function fetchJson(url, { method, headers, body, timeoutMs }) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), timeoutMs || CONFIG.httpTimeoutMs);
   try {
+    const hasBody = body !== undefined && body !== null;
+    const isRawBody =
+      hasBody &&
+      (typeof body === "string" ||
+        Buffer.isBuffer(body) ||
+        body instanceof ArrayBuffer ||
+        body instanceof Uint8Array ||
+        (typeof FormData !== "undefined" && body instanceof FormData));
     const res = await fetch(url, {
       method,
       headers,
-      body: body ? JSON.stringify(body) : undefined,
+      body: hasBody ? (isRawBody ? body : JSON.stringify(body)) : undefined,
       signal: ac.signal
     });
     const text = await res.text();
@@ -948,6 +1283,7 @@ async function handleChatCompletions(req, res) {
 
   return await withAccount({ requiredPro }, async (account) => {
     try {
+      await ensureAccountReady(account);
       const providedThreadId = getProvidedThreadIdFromRequest(openaiReq);
       const threadId = providedThreadId || (crypto.randomUUID ? crypto.randomUUID() : randomId("thread"));
       const plan = buildZeroTwoPlanFromOpenAI(
@@ -960,6 +1296,55 @@ async function handleChatCompletions(req, res) {
         threadId
       );
       const payload = plan.payload;
+
+      // 兼容 OpenAI multi-modal：若 messages 里出现 image_url/input_image，则自动上传并作为 attachments 注入。
+      const imageUrls = extractImageUrlsFromOpenAIRequest(openaiReq);
+      const hasExplicitAttachments = Array.isArray(openaiReq?.attachments) && openaiReq.attachments.length > 0;
+
+      if (imageUrls.length && !hasExplicitAttachments) {
+        const vsId = await ensureThreadVectorStore(account, threadId, { provider });
+        payload.contextData.thread_vector_store_id = vsId;
+        payload.contextData.vector_store_id = vsId;
+        payload.contextData.mode = payload.contextData.mode || { type: "thread", retrieval: null };
+        payload.contextData.mode.retrieval = ["thread"];
+
+        const attachments = [];
+        for (const u of imageUrls) {
+          const resolved = await resolveImageToUploadBytes(u);
+          const ct = String(resolved.contentType || "application/octet-stream");
+          const ext = extFromContentType(ct) || ".bin";
+          const name = `image_${randomId("img")}${ext}`.replace(/^image_/, ""); // 保持较短
+          const up = await uploadRagFile(account, {
+            threadId,
+            filename: name,
+            contentType: ct,
+            buffer: resolved.buffer,
+            processAsync: true
+          });
+          const d = up.data;
+          attachments.push(buildZeroTwoAttachmentFromUploadData(d));
+
+          const queueId = String(d?.queueId || "");
+          if (queueId && CONFIG.imageProcessingWaitMs > 0) {
+            await waitForFileProcessingCompletion(account, queueId, CONFIG.imageProcessingWaitMs);
+          }
+        }
+        if (attachments.length) payload.attachments = attachments;
+      } else if (hasExplicitAttachments) {
+        // 若调用方已自行上传，则直接透传 attachments，并尽量补齐检索所需的 vector_store_id。
+        payload.attachments = openaiReq.attachments;
+        const first = openaiReq.attachments[0];
+        const vs =
+          (typeof first?.vectorStoreId === "string" ? first.vectorStoreId : "") ||
+          (typeof first?.vector_store_id === "string" ? first.vector_store_id : "") ||
+          "";
+        if (vs) {
+          payload.contextData.thread_vector_store_id = vs;
+          payload.contextData.vector_store_id = vs;
+          payload.contextData.mode = payload.contextData.mode || { type: "thread", retrieval: null };
+          payload.contextData.mode.retrieval = ["thread"];
+        }
+      }
 
       let vectorStoreIdHint =
         typeof openaiReq?.metadata?.vectorStoreId === "string"
@@ -1017,6 +1402,44 @@ async function handleChatCompletions(req, res) {
       if (!e?.skipCircuitBreak) markFailure(account, e);
       throw e;
     }
+  });
+}
+
+async function handleRagUpload(req, res) {
+  const bodyBuf = await readBody(req, CONFIG.maxUploadBytes);
+  const parsed = parseMultipartFormData(bodyBuf, req.headers["content-type"]);
+  const filePart = parsed.files.file;
+  if (!filePart) throw createBadAttachmentsError("缺少 file 字段");
+
+  const threadId = String(parsed.fields.threadId || "").trim();
+  if (!threadId) throw createBadAttachmentsError("缺少 threadId");
+
+  const filename = String(parsed.fields.filename || filePart.filename || "upload").trim();
+  const contentType = String(parsed.fields.contentType || filePart.contentType || "application/octet-stream").trim();
+
+  // 使用服务端账号，不信任前端透传 userId（避免越权）
+  return await withAccount({}, async (account) => {
+    await ensureAccountReady(account);
+    await ensureThreadVectorStore(account, threadId, { provider: "openai" });
+
+	    const up = await uploadRagFile(account, {
+	      threadId,
+	      filename,
+	      contentType,
+	      buffer: filePart.buffer,
+	      processAsync: parsed.fields.processAsync !== "false"
+	    });
+	    return sendJson(res, 200, up);
+	  });
+}
+
+async function handleFileProcessingQueueProxy(req, res, url) {
+  const id = String(url.searchParams.get("id") || "").trim();
+  if (!id) return sendJson(res, 400, { error: { message: "缺少 id" } });
+  return await withAccount({}, async (account) => {
+    await ensureAccountReady(account);
+    const row = await getFileProcessingQueue(account, id);
+    return sendJson(res, 200, row || null);
   });
 }
 
@@ -1351,6 +1774,17 @@ async function main() {
       if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
         if (!requireApiKey(req)) return sendJson(res, 401, { error: { message: "缺少或错误的 API Key" } });
         return await handleChatCompletions(req, res);
+      }
+
+      if (url.pathname === "/api/rag/upload" && req.method === "POST") {
+        // 注意：该接口与浏览器/前端交互时，Authorization 往往用于 Supabase JWT，因此使用 x-api-key 进行鉴权。
+        if (!requireApiKey(req)) return sendJson(res, 401, { error: { message: "缺少或错误的 API Key" } });
+        return await handleRagUpload(req, res);
+      }
+
+      if (url.pathname === "/api/rag/file-processing-queue" && req.method === "GET") {
+        if (!requireApiKey(req)) return sendJson(res, 401, { error: { message: "缺少或错误的 API Key" } });
+        return await handleFileProcessingQueueProxy(req, res, url);
       }
 
       return sendJson(res, 404, { error: { message: "未找到" } });

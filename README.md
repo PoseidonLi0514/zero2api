@@ -43,7 +43,19 @@ docker compose up -d
   - 当 `provider` 为 `anthropic` 时，会把 `reasoning_effort`（支持字符串或数字）归一化为上游需要的“数字预算或 `off`”，并同时写入顶层与 `contextData.reasoning_effort`；`thinking` 仅用于推导该值，不会透传给上游
   - 路由规则：当 `provider` 为 `gemini` 或 `anthropic` 时，只会选用 `isPro=true` 的账号；否则按默认轮询选择
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
+  - 图片（实验性）：
+    - 当 `messages[].content` 包含 `image_url/input_image` 时，会自动调用上游 `POST /api/rag/upload` 上传图片并注入 `payload.attachments`，再开启 `thread` 检索（`contextData.mode.retrieval=["thread"]`）
+    - 支持 `data:`（base64）与 `http(s)` 图片 URL；默认最多等待 `60s` 处理完成（可用 `IMAGE_PROCESSING_WAIT_MS=0` 关闭等待）
   - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`
+
+## RAG 上传接口（可选）
+
+- `POST /api/rag/upload`
+  - 需要 `x-api-key: <API_KEY>`
+  - `multipart/form-data`：字段对齐 ZeroTwo（`file/filename/contentType/threadId/processAsync/...`）
+- `GET /api/rag/file-processing-queue?id=<queueId>`
+  - 需要 `x-api-key: <API_KEY>`
+  - 代理查询 `file_processing_queue` 状态（用于前端轮询展示进度）
 
 ## 网页管理
 
