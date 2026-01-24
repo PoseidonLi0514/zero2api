@@ -49,6 +49,13 @@ const CONFIG = {
 };
 
 const ANTHROPIC_THINKING_BUDGETS = [1024, 4096, 10000, 16000];
+const IMAGE_MODEL_IDS = [
+  "gpt-image-1.5",
+  "gpt-image-1",
+  "gpt-image-1-mini",
+  "imagen-4.0-generate-preview-06-06",
+  "nano-banana-pro"
+];
 
 function nowMs() {
   return Date.now();
@@ -363,6 +370,12 @@ function createBadAttachmentsError(message) {
   return err;
 }
 
+function createBadImageModelError(message) {
+  const err = new Error(message);
+  err.code = "BAD_IMAGE_MODEL";
+  return err;
+}
+
 async function fetchBuffer(url, { timeoutMs, maxBytes } = {}) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), Number(timeoutMs || CONFIG.httpTimeoutMs));
@@ -461,6 +474,51 @@ async function ensureThreadVectorStore(account, threadId, { provider } = {}) {
   });
 
   return vectorStoreId;
+}
+
+async function getProfileSettings(account, userId) {
+  const uid = String(userId || "").trim();
+  if (!uid) throw new Error("缺少 userId");
+  return await supabasePublicJson(account, `/rest/v1/profiles?select=settings&id=eq.${uid}`, {
+    method: "GET",
+    headers: { accept: "application/vnd.pgrst.object+json" }
+  });
+}
+
+function cloneJsonValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof structuredClone === "function") return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function setProfileImageModel(account, userId, imageModel) {
+  const uid = String(userId || "").trim();
+  if (!uid) throw new Error("缺少 userId");
+
+  const raw = typeof imageModel === "string" ? imageModel.trim() : "";
+  if (raw && !IMAGE_MODEL_IDS.includes(raw)) {
+    throw createBadImageModelError(`不支持的图像模型：${raw}`);
+  }
+
+  const existing = await getProfileSettings(account, uid);
+  const settings = existing?.settings && typeof existing.settings === "object" ? existing.settings : {};
+  const nextSettings = cloneJsonValue(settings) || {};
+  if (!nextSettings.preferences || typeof nextSettings.preferences !== "object") nextSettings.preferences = {};
+
+  if (!raw) {
+    delete nextSettings.preferences.image_model;
+  } else {
+    nextSettings.preferences.image_model = raw;
+  }
+
+  return await supabasePublicJson(account, `/rest/v1/profiles?id=eq.${uid}&select=settings`, {
+    method: "PATCH",
+    headers: {
+      accept: "application/vnd.pgrst.object+json",
+      prefer: "return=representation"
+    },
+    body: { settings: nextSettings, updated_at: new Date().toISOString() }
+  });
 }
 
 async function uploadRagFile(account, { threadId, filename, contentType, buffer, processAsync } = {}) {
@@ -1668,6 +1726,34 @@ async function handleAdminApi(req, res, url) {
     return sendJson(res, 200, { ok: true });
   }
 
+  const mImageModel = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/image-model$/);
+  if (mImageModel && req.method === "GET") {
+    const id = mImageModel[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    if (!a.userId) return sendJson(res, 400, { error: { message: "该账号缺少 userId，无法读取 profiles" } });
+    await ensureAccountReady(a);
+    const row = await getProfileSettings(a, a.userId);
+    const image_model =
+      typeof row?.settings?.preferences?.image_model === "string" ? row.settings.preferences.image_model : "";
+    return sendJson(res, 200, { ok: true, userId: a.userId, image_model, available: IMAGE_MODEL_IDS });
+  }
+  if (mImageModel && req.method === "POST") {
+    const id = mImageModel[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    if (!a.userId) return sendJson(res, 400, { error: { message: "该账号缺少 userId，无法更新 profiles" } });
+    const body = await readBody(req);
+    const parsed = safeJsonParse(body.toString("utf8"));
+    if (!parsed.ok) return sendJson(res, 400, { error: { message: "JSON 解析失败" } });
+    const image_model = typeof parsed.value?.image_model === "string" ? parsed.value.image_model : "";
+    await ensureAccountReady(a);
+    const patched = await setProfileImageModel(a, a.userId, image_model);
+    const next =
+      typeof patched?.settings?.preferences?.image_model === "string" ? patched.settings.preferences.image_model : "";
+    return sendJson(res, 200, { ok: true, userId: a.userId, image_model: next, available: IMAGE_MODEL_IDS });
+  }
+
   const mDelete = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)$/);
   if (req.method === "DELETE" && mDelete) {
     const id = mDelete[1];
@@ -1790,16 +1876,19 @@ async function main() {
       }
 
       return sendJson(res, 404, { error: { message: "未找到" } });
-    } catch (e) {
-      if (e?.code === "BAD_ATTACHMENTS") {
-        return sendJson(res, 400, { error: { message: String(e?.message || e), type: "invalid_request_error" } });
-      }
-      if (e?.code === "NO_ACCOUNT") {
-        return sendJson(res, 503, { error: { message: String(e?.message || e), type: "server_error" } });
-      }
-      return sendJson(res, 500, { error: { message: String(e?.message || e) } });
-    }
-  });
+	    } catch (e) {
+	      if (e?.code === "BAD_ATTACHMENTS") {
+	        return sendJson(res, 400, { error: { message: String(e?.message || e), type: "invalid_request_error" } });
+	      }
+	      if (e?.code === "BAD_IMAGE_MODEL") {
+	        return sendJson(res, 400, { error: { message: String(e?.message || e), type: "invalid_request_error" } });
+	      }
+	      if (e?.code === "NO_ACCOUNT") {
+	        return sendJson(res, 503, { error: { message: String(e?.message || e), type: "server_error" } });
+	      }
+	      return sendJson(res, 500, { error: { message: String(e?.message || e) } });
+	    }
+	  });
 
   server.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`[server] listening on http://${CONFIG.host}:${CONFIG.port}`);
