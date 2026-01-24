@@ -10,6 +10,14 @@ const toastTitleEl = document.getElementById("toastTitle");
 const toastMessageEl = document.getElementById("toastMessage");
 const toastCloseEl = document.getElementById("toastClose");
 
+const IMAGE_MODEL_IDS = [
+  "gpt-image-1.5",
+  "gpt-image-1",
+  "gpt-image-1-mini",
+  "imagen-4.0-generate-preview-06-06",
+  "nano-banana-pro"
+];
+
 apiKeyEl.value = localStorage.getItem("zt_api_key") || "";
 
 function setStatus(message, state) {
@@ -125,6 +133,7 @@ function renderTable(accounts) {
     const tr = document.createElement("tr");
     if (a.disabled) tr.classList.add("is-disabled");
     const idEnc = encodeURIComponent(String(a.id || ""));
+    const hasUserId = Boolean(a.userId);
     const inCircuit = Boolean(a.circuitUntilMs && a.circuitUntilMs > Date.now());
     const inCooldown = Boolean(a.authSecurityCooldownUntilMs && a.authSecurityCooldownUntilMs > Date.now());
     const proBadge = a.isPro ? "<span class='pill pro'>Pro</span>" : "<span class='pill basic'>Standard</span>";
@@ -141,6 +150,11 @@ function renderTable(accounts) {
       <td><code>${escapeHtml(a.id)}</code></td>
       <td class="col-email">${escapeHtml(email)}</td>
       <td>${proBadge}</td>
+      <td>
+        <select class="image-model" data-act="imageModel" data-id="${idEnc}" ${hasUserId ? "" : "disabled"}>
+          <option value="">${hasUserId ? "加载中..." : "无 userId"}</option>
+        </select>
+      </td>
       <td>${a.inflight}/${a.maxInflight}</td>
       <td>${fmtTime(a.accessExpiresAtMs)} <span class="muted">${fmtLeft(a.accessExpiresAtMs)}</span></td>
       <td>${fmtTime(a.signedExpiresAtMs)} <span class="muted">${fmtLeft(a.signedExpiresAtMs)}</span></td>
@@ -160,6 +174,34 @@ function renderTable(accounts) {
     `;
     tbody.appendChild(tr);
   });
+}
+
+function buildImageModelOptions(current, available) {
+  const list = Array.isArray(available) && available.length ? available : IMAGE_MODEL_IDS;
+  const opts = [`<option value="">（未设置）</option>`];
+  for (const id of list) {
+    const selected = id === current ? " selected" : "";
+    opts.push(`<option value="${escapeHtml(id)}"${selected}>${escapeHtml(id)}</option>`);
+  }
+  return opts.join("");
+}
+
+async function hydrateImageModelSelects() {
+  const selects = tbody.querySelectorAll('select[data-act="imageModel"]');
+  for (const sel of selects) {
+    const id = sel.getAttribute("data-id");
+    if (!id || sel.disabled) continue;
+    try {
+      const data = await api(`/admin/api/accounts/${id}/image-model`, { method: "GET" });
+      const current = typeof data?.image_model === "string" ? data.image_model : "";
+      sel.innerHTML = buildImageModelOptions(current, data?.available);
+      sel.value = current;
+      sel.dataset.prev = current;
+    } catch (e) {
+      sel.innerHTML = `<option value="">加载失败</option>`;
+      sel.dataset.prev = "";
+    }
+  }
 }
 
 tbody.addEventListener("click", async (event) => {
@@ -196,6 +238,35 @@ tbody.addEventListener("click", async (event) => {
   }
 });
 
+tbody.addEventListener("change", async (event) => {
+  const sel = event.target.closest('select[data-act="imageModel"]');
+  if (!sel) return;
+  const id = sel.getAttribute("data-id");
+  if (!id) return;
+  const next = String(sel.value || "");
+  const prev = String(sel.dataset.prev || "");
+  if (next === prev) return;
+  sel.disabled = true;
+  setStatus("更新图像模型中...", "");
+  try {
+    const data = await api(`/admin/api/accounts/${id}/image-model`, {
+      method: "POST",
+      body: JSON.stringify({ image_model: next })
+    });
+    const current = typeof data?.image_model === "string" ? data.image_model : "";
+    sel.innerHTML = buildImageModelOptions(current, data?.available);
+    sel.value = current;
+    sel.dataset.prev = current;
+    setStatus("图像模型已更新。", "ok");
+  } catch (e) {
+    sel.value = prev;
+    setStatus(`图像模型更新失败：${e.message}`, "error");
+    showToast({ title: "图像模型更新失败", message: e.message });
+  } finally {
+    sel.disabled = false;
+  }
+});
+
 async function load() {
   setStatus("加载中...", "");
   try {
@@ -205,6 +276,7 @@ async function load() {
     countEl.textContent = String(accounts.length);
     proCountEl.textContent = String(proCount);
     renderTable(accounts);
+    hydrateImageModelSelects().catch(() => {});
     setStatus("就绪。", "ok");
   } catch (e) {
     setStatus(`加载失败：${e.message}（请先填写正确的 API Key）`, "error");

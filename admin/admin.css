@@ -214,7 +214,8 @@ code {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border-radius: 12px;
   border: 1px solid var(--stroke);
@@ -231,10 +232,15 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   outline: none;
   border-color: rgba(31, 111, 102, 0.5);
   box-shadow: 0 0 0 3px rgba(31, 111, 102, 0.15);
+}
+
+select.image-model {
+  min-width: 220px;
 }
 
 .btn {
