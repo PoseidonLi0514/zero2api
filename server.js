@@ -14,7 +14,9 @@ const CONFIG = {
   accountsFile: process.env.ACCOUNTS_FILE || path.join(__dirname, "data", "accounts.json"),
   maxRequestBodyBytes: Number(process.env.MAX_REQUEST_BODY_BYTES || 20 * 1024 * 1024),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024),
-  imageProcessingWaitMs: Number(process.env.IMAGE_PROCESSING_WAIT_MS || 60 * 1000),
+  // 图片上传后是否等待 file_processing_queue 入库完成；默认不等待（0），更贴近官方前端的“异步处理 + 轮询状态”体验
+  // 经过多次测试推荐20s，设为默认
+  imageProcessingWaitMs: Number(process.env.IMAGE_PROCESSING_WAIT_MS || 20 * 1000),
   imageProcessingPollIntervalMs: Number(process.env.IMAGE_PROCESSING_POLL_INTERVAL_MS || 750),
 
   supabaseBase: "https://db.zerotwo.ai",

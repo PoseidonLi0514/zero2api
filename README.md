@@ -45,7 +45,7 @@ docker compose up -d
   - 当 `messages[].content` 为数组时，仅提取 `text/input_text` 作为文本内容转发（忽略非文本段）
   - 图片（实验性）：
     - 当 `messages[].content` 包含 `image_url/input_image` 时，会自动调用上游 `POST /api/rag/upload` 上传图片并注入 `payload.attachments`，再开启 `thread` 检索（`contextData.mode.retrieval=["thread"]`）
-    - 支持 `data:`（base64）与 `http(s)` 图片 URL；默认最多等待 `60s` 处理完成（可用 `IMAGE_PROCESSING_WAIT_MS=0` 关闭等待）
+    - 支持 `data:`（base64）与 `http(s)` 图片 URL；默认等待20s处理完成（`IMAGE_PROCESSING_WAIT_MS=20 * 1000`），如需等待可设置为毫秒数（例如 `3000`/`60000`）
   - 系统指令走 `instructions` 字段：默认把 `messages[].role=system` 拼接后注入到顶层 `instructions`；仅当没有 system 消息时，才使用顶层 `instructions`
 
 ## RAG 上传接口（可选）
