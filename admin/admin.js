@@ -10,6 +10,12 @@ const toastTitleEl = document.getElementById("toastTitle");
 const toastMessageEl = document.getElementById("toastMessage");
 const toastCloseEl = document.getElementById("toastClose");
 
+// Batch UI Elements
+const selectAllEl = document.getElementById("selectAll");
+const batchBarEl = document.getElementById("batchBar");
+const batchCountEl = document.getElementById("batchCount");
+const batchActionsEl = document.querySelector(".batch-actions");
+
 const IMAGE_MODEL_IDS = [
   "gpt-image-1.5",
   "gpt-image-1",
@@ -129,6 +135,11 @@ async function api(path, opts = {}) {
 
 function renderTable(accounts) {
   tbody.innerHTML = "";
+  // Reset selection on re-render
+  selectAllEl.checked = false;
+  selectAllEl.indeterminate = false;
+  updateBatchUI();
+
   accounts.forEach((a, index) => {
     const tr = document.createElement("tr");
     if (a.disabled) tr.classList.add("is-disabled");
@@ -146,6 +157,9 @@ function renderTable(accounts) {
     const circuitReason = inCircuit && a.lastError ? escapeHtml(a.lastError) : "";
     const cooldownReason = inCooldown ? `认证限流冷却（${fmtCooldownLeft(a.authSecurityCooldownUntilMs)}）` : "";
     tr.innerHTML = `
+      <td class="col-check">
+        <input type="checkbox" class="row-select" data-id="${idEnc}" aria-label="选择账号" />
+      </td>
       <td>${index + 1}</td>
       <td><code>${escapeHtml(a.id)}</code></td>
       <td class="col-email">${escapeHtml(email)}</td>
@@ -175,6 +189,130 @@ function renderTable(accounts) {
     tbody.appendChild(tr);
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch Selection Logic
+// ─────────────────────────────────────────────────────────────────────────────
+
+function updateBatchUI() {
+  const checkboxes = document.querySelectorAll(".row-select");
+  const checked = Array.from(checkboxes).filter((c) => c.checked);
+  const count = checked.length;
+  const total = checkboxes.length;
+
+  batchCountEl.textContent = count;
+  if (count > 0) {
+    batchBarEl.classList.add("is-visible");
+  } else {
+    batchBarEl.classList.remove("is-visible");
+  }
+
+  // Update Select All state
+  if (count === 0) {
+    selectAllEl.checked = false;
+    selectAllEl.indeterminate = false;
+  } else if (count === total && total > 0) {
+    selectAllEl.checked = true;
+    selectAllEl.indeterminate = false;
+  } else {
+    selectAllEl.checked = false;
+    selectAllEl.indeterminate = true;
+  }
+}
+
+selectAllEl.addEventListener("change", (e) => {
+  const checkboxes = document.querySelectorAll(".row-select");
+  checkboxes.forEach((cb) => (cb.checked = e.target.checked));
+  updateBatchUI();
+});
+
+tbody.addEventListener("change", (e) => {
+  if (e.target.classList.contains("row-select")) {
+    updateBatchUI();
+  }
+});
+
+batchActionsEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-batch]");
+  if (!btn) return;
+  const action = btn.dataset.batch;
+  
+  const checkboxes = document.querySelectorAll(".row-select:checked");
+  const ids = Array.from(checkboxes).map((cb) => cb.dataset.id);
+  
+  if (ids.length === 0) return;
+  if (action === "delete") {
+    const ok = window.confirm(`确定要删除选中的 ${ids.length} 个账号吗？此操作无法撤销。`);
+    if (!ok) return;
+  }
+
+  setStatus(`正在批量执行... (0/${ids.length})`, "");
+  let successCount = 0;
+  let failCount = 0;
+
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
+    setStatus(`正在批量执行... (${i + 1}/${ids.length})`, "");
+    try {
+      if (action === "refreshAccess") await api(`/admin/api/accounts/${id}/refresh-access`, { method: "POST" });
+      else if (action === "refreshSecurity") await api(`/admin/api/accounts/${id}/refresh-security`, { method: "POST" });
+      else if (action === "setPro") {
+         // Logic check: only if not already Pro? API toggles, so we might need state.
+         // Actually current API is toggle-pro. If we blindly call toggle-pro, it might flip back.
+         // Wait, server logic: handleAdminApi has `toggle-pro` which likely toggles.
+         // Ideally we check current state. But iterating local DOM or data is easier.
+         // Let's grab the row data-id, find row, check text content? Or just hit it.
+         // Better: check the row's "isPro" state from the UI?
+         // Since I didn't store raw data in DOM easily, let's look at the pill?
+         // Or just assume the user selected "Standard" ones to "Set Pro".
+         // Actually, if I mix them, it will flip them all.
+         // For now, let's just call toggle-pro. If it's mixed, they swap places. 
+         // A more robust way would be to read the row's current state.
+         // Let's try to be smart: look at the pill in the same row.
+         const row = document.querySelector(`.row-select[data-id="${id}"]`).closest("tr");
+         const isPro = row.querySelector(".pill.pro");
+         if (action === "setPro" && isPro) continue; // Already Pro
+         if (action === "unsetPro" && !isPro) continue; // Already Standard
+         await api(`/admin/api/accounts/${id}/toggle-pro`, { method: "POST" });
+      }
+      else if (action === "unsetPro") {
+         const row = document.querySelector(`.row-select[data-id="${id}"]`).closest("tr");
+         const isPro = row.querySelector(".pill.pro");
+         if (!isPro) continue; 
+         await api(`/admin/api/accounts/${id}/toggle-pro`, { method: "POST" });
+      }
+      else if (action === "enable") {
+         const row = document.querySelector(`.row-select[data-id="${id}"]`).closest("tr");
+         const isDisabled = row.querySelector(".btn[data-act='toggle']").textContent.trim() === "启用"; // Button says "Enable" if currently disabled
+         if (!isDisabled) continue;
+         await api(`/admin/api/accounts/${id}/toggle`, { method: "POST" });
+      }
+      else if (action === "disable") {
+         const row = document.querySelector(`.row-select[data-id="${id}"]`).closest("tr");
+         const isDisabled = row.querySelector(".btn[data-act='toggle']").textContent.trim() === "启用";
+         if (isDisabled) continue;
+         await api(`/admin/api/accounts/${id}/toggle`, { method: "POST" });
+      }
+      else if (action === "delete") await api(`/admin/api/accounts/${id}`, { method: "DELETE" });
+      
+      successCount++;
+    } catch (e) {
+      console.error(`Batch action failed for ${id}:`, e);
+      failCount++;
+    }
+  }
+
+  const resultMsg = `批量操作完成：成功 ${successCount}，失败 ${failCount}`;
+  setStatus(resultMsg, failCount > 0 ? "error" : "ok");
+  showToast({ 
+    title: "批量操作结束", 
+    message: resultMsg,
+    ms: 5000 
+  });
+  
+  await load();
+});
+
 
 function buildImageModelOptions(current, available) {
   const list = Array.isArray(available) && available.length ? available : IMAGE_MODEL_IDS;

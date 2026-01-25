@@ -88,6 +88,7 @@
           <table>
             <thead>
               <tr>
+                <th class="col-check"><input type="checkbox" id="selectAll" aria-label="全选" /></th>
                 <th>序号</th>
                 <th>ID</th>
                 <th>邮箱</th>
@@ -105,6 +106,21 @@
           </table>
         </div>
       </section>
+
+      <div id="batchBar" class="batch-bar">
+        <div class="batch-info">
+          已选 <span id="batchCount" class="batch-count">0</span> 项
+        </div>
+        <div class="batch-actions">
+          <button class="btn ghost" data-batch="refreshAccess">刷新 Access</button>
+          <button class="btn ghost" data-batch="refreshSecurity">刷新 Security</button>
+          <button class="btn ghost" data-batch="setPro">设为 Pro</button>
+          <button class="btn ghost" data-batch="unsetPro">取消 Pro</button>
+          <button class="btn warn" data-batch="enable">启用</button>
+          <button class="btn warn" data-batch="disable">禁用</button>
+          <button class="btn danger" data-batch="delete">删除</button>
+        </div>
+      </div>
     </main>
   </body>
 </html>

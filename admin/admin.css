@@ -324,6 +324,75 @@ textarea {
   resize: vertical;
 }
 
+select.image-model {
+  min-width: 350px;
+  max-width: 100%;
+  cursor: pointer;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Batch Actions Bar
+   ───────────────────────────────────────────────────────────────────────────── */
+.batch-bar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(150%);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  padding: 12px 24px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--border-subtle);
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  z-index: 50;
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  min-width: 600px;
+  justify-content: space-between;
+}
+
+.batch-bar.is-visible {
+  transform: translateX(-50%) translateY(0);
+}
+
+.batch-info {
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-count {
+  background: var(--accent);
+  color: white;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 12px;
+}
+
+.batch-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Checkbox Column */
+th.col-check,
+td.col-check {
+  width: 40px;
+  text-align: center;
+  padding-right: 8px;
+}
+
+input[type="checkbox"].row-select {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    Buttons
    ───────────────────────────────────────────────────────────────────────────── */
