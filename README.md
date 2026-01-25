@@ -69,6 +69,12 @@ docker compose up -d
   - `POST /admin/api/accounts/:id/toggle`
   - `DELETE /admin/api/accounts/:id`
 
+## 生图配置
+
+- 无法直接调用生图模型。只能通过语言模型间接调用生图模型。
+- 其中语言模型调用的参数中只有 `gpt-image-1` 具体模型取决于网页端配置的用户设置。
+- 并无精细调用参数，但是可以通过命令语言模型来调整，目前已知的是`size` `quality` `prompt`等，`size`没有比例之分
+
 ## 后台刷新策略（简述）
 
 - 后台定时任务默认每 `20s` 扫描一次需要刷新的账号（见 `BACKGROUND_TICK_MS`/`backgroundTickMs`）。
