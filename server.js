@@ -6,6 +6,10 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Readable } = require("node:stream");
 
+function isEnvOn(name) {
+  return /^(1|true|yes|on)$/i.test(String(process.env[name] || ""));
+}
+
 const CONFIG = {
   port: Number(process.env.PORT || 8787),
   host: process.env.HOST || "0.0.0.0",
@@ -44,7 +48,12 @@ const CONFIG = {
   defaultMaxInflightPerAccount: 8,
 
   // 请求超时
-  httpTimeoutMs: 60 * 1000
+  httpTimeoutMs: 60 * 1000,
+
+  // Debug 开关（默认关闭）
+  debugMode: isEnvOn("DEBUG_MODE") || isEnvOn("DEBUG_RAW_STREAM"),
+  debugRawStream: isEnvOn("DEBUG_RAW_STREAM") || isEnvOn("DEBUG_MODE"),
+  debugLogMaxChars: Number(process.env.DEBUG_LOG_MAX_CHARS || 4000)
 };
 
 const ANTHROPIC_THINKING_BUDGETS = [1024, 4096, 10000, 16000];
@@ -58,6 +67,34 @@ const IMAGE_MODEL_IDS = [
 
 function nowMs() {
   return Date.now();
+}
+
+function clipForLog(value, maxChars = CONFIG.debugLogMaxChars) {
+  let s = "";
+  if (typeof value === "string") s = value;
+  else {
+    try {
+      s = JSON.stringify(value);
+    } catch (e) {
+      s = String(value ?? e ?? "");
+    }
+  }
+  if (!s) return "";
+  const limit = Number(maxChars || 0);
+  if (!Number.isFinite(limit) || limit <= 0) return s;
+  if (s.length <= limit) return s;
+  return `${s.slice(0, limit)}...<truncated ${s.length - limit} chars>`;
+}
+
+function debugLog(tag, payload) {
+  if (!CONFIG.debugMode) return;
+  const ts = new Date().toISOString();
+  if (payload === undefined) {
+    console.log(`[debug][${ts}][${tag}]`);
+    return;
+  }
+  const line = typeof payload === "string" ? payload : JSON.stringify(payload);
+  console.log(`[debug][${ts}][${tag}] ${clipForLog(line)}`);
 }
 
 function sha256Base64Url(input) {
@@ -1461,6 +1498,19 @@ async function handleChatCompletions(req, res) {
       const ac = new AbortController();
       req.on("close", () => ac.abort());
       const timeout = setTimeout(() => ac.abort(), CONFIG.httpTimeoutMs);
+      if (CONFIG.debugMode) {
+        debugLog("upstream_request", {
+          accountId: account.id,
+          provider: payload.provider,
+          model: payload.model,
+          threadId: payload?.tracking?.threadId || "",
+          featureId: payload.featureId || "",
+          messageCount: Array.isArray(payload.messages) ? payload.messages.length : 0,
+          reasoningEffort: payload.reasoning_effort,
+          hasAttachments: Array.isArray(payload.attachments) && payload.attachments.length > 0
+        });
+        debugLog("upstream_request_payload", payload);
+      }
 
       const zRes = await fetch(url, {
         method: "POST",
@@ -1471,6 +1521,13 @@ async function handleChatCompletions(req, res) {
 
       if (!zRes.ok) {
         const text = await zRes.text();
+        if (CONFIG.debugMode) {
+          debugLog("upstream_non_2xx", {
+            status: zRes.status,
+            statusText: zRes.statusText || "",
+            body: clipForLog(text)
+          });
+        }
         const err = new Error(`ZeroTwo 请求失败: ${zRes.status} ${text.slice(0, 200)}`);
         err.status = zRes.status;
         err.body = text;
@@ -1547,87 +1604,77 @@ async function streamZeroTwoToOpenAI(zRes, openaiReq, res, { stream, includeUsag
   const state = { buffer: "" };
   const nodeStream = Readable.fromWeb(zRes.body);
   const decoder = new TextDecoder("utf-8");
+  const rawStreamDebug = CONFIG.debugRawStream;
+
+  const consumeSseData = (data) => {
+    if (rawStreamDebug) debugLog("upstream_sse_data_raw", data);
+    const parsed = safeJsonParse(data);
+    if (!parsed.ok) {
+      if (rawStreamDebug) debugLog("upstream_sse_data_parse_error", parsed.error || "json parse failed");
+      return;
+    }
+    const msg = parsed.value;
+    const entity = msg?.entity;
+    const status = msg?.status;
+
+    if (entity === "message.content" && status === "delta") {
+      const t = msg?.v?.delta?.text;
+      if (typeof t === "string" && t) {
+        content += t;
+        if (stream) {
+          const chunkPayload = {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: t }, finish_reason: null }]
+          };
+          res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+        }
+      }
+    }
+
+    if (entity === "message.thinking" && status === "delta") {
+      const r = msg?.v?.delta?.reasoning;
+      if (typeof r === "string" && r) {
+        reasoning += r;
+        if (stream) {
+          // 兼容“reasoning delta”习惯：不影响只认 content 的客户端
+          const chunkPayload = {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{ index: 0, delta: { reasoning: r }, finish_reason: null }]
+          };
+          res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
+        }
+      }
+    }
+
+    if (entity === "message" && status === "completed") {
+      usage = buildOpenAIUsageFromZeroTwoUsage(msg?.v?.usage);
+    }
+
+    if (entity === "stream" && status === "completed") {
+      finished = true;
+    }
+  };
 
   for await (const chunk of nodeStream) {
     // 重要：用流式 UTF-8 解码，避免多字节字符跨 chunk 导致 JSON 解析失败（Claude 中文/emoji 更容易触发）
     const text = decoder.decode(chunk, { stream: true });
-    parseSseEventsFromTextChunk(state, text, (data) => {
-      const parsed = safeJsonParse(data);
-      if (!parsed.ok) return;
-      const msg = parsed.value;
-      const entity = msg?.entity;
-      const status = msg?.status;
-
-      if (entity === "message.content" && status === "delta") {
-        const t = msg?.v?.delta?.text;
-        if (typeof t === "string" && t) {
-          content += t;
-          if (stream) {
-            const chunkPayload = {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: t }, finish_reason: null }]
-            };
-            res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
-          }
-        }
-      }
-
-      if (entity === "message.thinking" && status === "delta") {
-        const r = msg?.v?.delta?.reasoning;
-        if (typeof r === "string" && r) {
-          reasoning += r;
-          if (stream) {
-            // 兼容“reasoning delta”习惯：不影响只认 content 的客户端
-            const chunkPayload = {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [{ index: 0, delta: { reasoning: r }, finish_reason: null }]
-            };
-            res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
-          }
-        }
-      }
-
-      if (entity === "message" && status === "completed") {
-        usage = buildOpenAIUsageFromZeroTwoUsage(msg?.v?.usage);
-      }
-
-      if (entity === "stream" && status === "completed") {
-        finished = true;
-      }
-    });
+    if (rawStreamDebug && text) debugLog("upstream_sse_chunk_raw", text);
+    parseSseEventsFromTextChunk(state, text, consumeSseData);
   }
   // flush decoder
   const tail = decoder.decode();
   if (tail) {
-    parseSseEventsFromTextChunk(state, tail, (data) => {
-      const parsed = safeJsonParse(data);
-      if (!parsed.ok) return;
-      const msg = parsed.value;
-      const entity = msg?.entity;
-      const status = msg?.status;
-      if (entity === "message.content" && status === "delta") {
-        const t = msg?.v?.delta?.text;
-        if (typeof t === "string" && t) {
-          content += t;
-          if (stream) {
-            const chunkPayload = {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: t }, finish_reason: null }]
-            };
-            res.write(`data: ${JSON.stringify(chunkPayload)}\n\n`);
-          }
-        }
-      }
-    });
+    if (rawStreamDebug) debugLog("upstream_sse_tail_raw", tail);
+    parseSseEventsFromTextChunk(state, tail, consumeSseData);
+  }
+  if (rawStreamDebug && state.buffer) {
+    debugLog("upstream_sse_buffer_remaining", state.buffer);
   }
 
   if (stream) {

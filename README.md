@@ -11,6 +11,16 @@ PORT=8787 \
 node server.js
 ```
 
+调试上游流（默认关闭）：
+
+```bash
+DEBUG_MODE=1 DEBUG_RAW_STREAM=1 node server.js
+```
+
+- `DEBUG_MODE=1`：打印上游请求摘要、请求 payload（截断）和非 2xx 响应体。
+- `DEBUG_RAW_STREAM=1`：额外打印上游原始 SSE chunk 与 `data:` 事件（日志量较大）。
+- `DEBUG_LOG_MAX_CHARS`：单条日志最大长度，默认 `4000`。
+
 ## Docker / Docker Compose 部署
 
 在服务器上执行：
