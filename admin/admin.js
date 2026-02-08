@@ -171,7 +171,6 @@ function renderTable(accounts) {
       </td>
       <td>${a.inflight}/${a.maxInflight}</td>
       <td>${fmtTime(a.accessExpiresAtMs)} <span class="muted">${fmtLeft(a.accessExpiresAtMs)}</span></td>
-      <td>${fmtTime(a.signedExpiresAtMs)} <span class="muted">${fmtLeft(a.signedExpiresAtMs)}</span></td>
       <td>${fmtTime(a.csrfExpiresAtMs)} <span class="muted">${fmtLeft(a.csrfExpiresAtMs)}</span></td>
       <td>${circuitBadge}<div class="muted col-error">${circuitReason || escapeHtml(cooldownReason)}</div></td>
       <td>

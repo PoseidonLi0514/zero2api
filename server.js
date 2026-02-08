@@ -25,12 +25,11 @@ const CONFIG = {
     process.env.SUPABASE_ANON_KEY ||
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpkYmNldmpicWFveHJ4eHdxd3V4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyNDcyMzUsImV4cCI6MjA3MzgyMzIzNX0.UcUJUjMocwijFTtYFKYuTgIODYWc4uxDByu2tI6XGQg",
 
-  zerotwoApiBase: process.env.ZEROTWO_API_BASE || "https://zerotwoapi-wajz.onrender.com",
-  zerotwoOrigin: "https://zerotwo.ai",
+  zerotwoApiBase: process.env.ZEROTWO_API_BASE || "https://api.zerotwo.ai",
+  zerotwoOrigin: process.env.ZEROTWO_ORIGIN || "https://app.zerotwo.ai",
 
   // 高并发下抖动控制：提前刷新 + 单飞互斥 + 熔断退避
   accessRefreshLeewayMs: 20 * 60 * 1000,
-  signedRefreshLeewayMs: 3 * 60 * 1000,
   csrfRefreshLeewayMs: 60 * 60 * 1000,
   // 当触发“authentication rate limit”时，Security 刷新冷却时间（避免 20s 频率加重限流）
   auth429SecurityCooldownMs: 10 * 60 * 1000,
@@ -93,6 +92,37 @@ function parseJwtPayload(token) {
   } catch {
     return null;
   }
+}
+
+function csrfCookieFromSecurity(security) {
+  const rawCookie = typeof security?.csrfCookie === "string" ? security.csrfCookie.trim() : "";
+  if (rawCookie) return rawCookie;
+  const token = typeof security?.csrfToken === "string" ? security.csrfToken.trim() : "";
+  return token ? `__csrf=${token}` : "";
+}
+
+function extractCsrfCookieFromSetCookie(rawSetCookie) {
+  const raw = typeof rawSetCookie === "string" ? rawSetCookie : "";
+  if (!raw) return "";
+  const m = raw.match(/(?:^|,\s*)__csrf=([^;,\s]+)/);
+  return m ? `__csrf=${m[1]}` : "";
+}
+
+function extractCsrfCookieFromHeaders(headers) {
+  if (!headers) return "";
+  if (typeof headers.getSetCookie === "function") {
+    const setCookies = headers.getSetCookie();
+    if (Array.isArray(setCookies)) {
+      for (const item of setCookies) {
+        const cookie = extractCsrfCookieFromSetCookie(item);
+        if (cookie) return cookie;
+      }
+    }
+  }
+  if (typeof headers.get === "function") {
+    return extractCsrfCookieFromSetCookie(headers.get("set-cookie") || "");
+  }
+  return "";
 }
 
 function randomId(prefix) {
@@ -541,14 +571,7 @@ async function uploadRagFile(account, { threadId, filename, contentType, buffer,
   const url = `${CONFIG.zerotwoApiBase}/api/rag/upload`;
   const res = await fetchJson(url, {
     method: "POST",
-    headers: {
-      accept: "*/*",
-      authorization: `Bearer ${account.accessToken}`,
-      origin: CONFIG.zerotwoOrigin,
-      referer: `${CONFIG.zerotwoOrigin}/`,
-      "x-csrf-token": account.security.csrfToken,
-      "x-signed-token": account.security.signedToken
-    },
+    headers: buildZeroTwoAuthHeaders(account, { includeCsrf: true }),
     body: form
   });
   if (!res.ok) throw createUpstreamHttpError("rag/upload 失败", res);
@@ -781,7 +804,6 @@ class TokenStore {
         disabled: Boolean(a.disabled),
         userId: a.userId || "",
         accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
-        signedExpiresAtMs: Number(a.security?.signedExpiresAtMs || 0),
         csrfExpiresAtMs: Number(a.security?.csrfExpiresAtMs || 0),
         inflight: Number(rt.inflight || 0),
         circuitUntilMs,
@@ -923,6 +945,24 @@ async function fetchJson(url, { method, headers, body, timeoutMs }) {
   }
 }
 
+function buildZeroTwoAuthHeaders(account, { contentType, accept = "*/*", includeCsrf = true, extra } = {}) {
+  const headers = {
+    accept,
+    authorization: `Bearer ${account.accessToken}`,
+    origin: CONFIG.zerotwoOrigin,
+    referer: `${CONFIG.zerotwoOrigin}/`
+  };
+  if (contentType) headers["content-type"] = contentType;
+  if (includeCsrf) {
+    const csrfToken = typeof account.security?.csrfToken === "string" ? account.security.csrfToken : "";
+    if (csrfToken) headers["x-csrf-token"] = csrfToken;
+    const csrfCookie = csrfCookieFromSecurity(account.security);
+    if (csrfCookie) headers.cookie = csrfCookie;
+  }
+  if (extra && typeof extra === "object") Object.assign(headers, extra);
+  return headers;
+}
+
 function createUpstreamHttpError(prefix, res) {
   const message = `${prefix}: ${res?.status || 0} ${String(res?.text || "").slice(0, 200)}`;
   const err = new Error(message);
@@ -1004,28 +1044,25 @@ async function refreshSecurityTokens(account) {
   return await store.runtimeState(account.id).securityMutex.run(async () => {
     const now = nowMs();
     const sec = account.security || null;
-    if (sec?.signedToken && Number(sec.signedExpiresAtMs || 0) - now > CONFIG.signedRefreshLeewayMs) {
+    if (sec?.csrfToken && Number(sec.csrfExpiresAtMs || 0) - now > CONFIG.csrfRefreshLeewayMs) {
       return { refreshed: false };
     }
 
-    if (!account.accessToken || account.accessExpiresAtMs - now <= CONFIG.accessRefreshLeewayMs) {
-      await refreshSupabaseSession(account);
-    }
-
-    const url = `${CONFIG.zerotwoApiBase}/api/auth/security-tokens`;
+    const url = `${CONFIG.zerotwoApiBase}/api/auth/csrf-token`;
+    const csrfCookie = csrfCookieFromSecurity(sec);
     const res = await fetchJson(url, {
-      method: "POST",
+      method: "GET",
       headers: {
         accept: "*/*",
-        authorization: `Bearer ${account.accessToken}`,
-        "content-type": "application/json",
+        ...(account.accessToken ? { authorization: `Bearer ${account.accessToken}` } : {}),
         origin: CONFIG.zerotwoOrigin,
-        referer: `${CONFIG.zerotwoOrigin}/`
+        referer: `${CONFIG.zerotwoOrigin}/`,
+        ...(csrfCookie ? { cookie: csrfCookie } : {})
       },
-      body: null
+      body: undefined
     });
     if (!res.ok || !res.json?.success) {
-      const err = createUpstreamHttpError("security-tokens 失败", res);
+      const err = createUpstreamHttpError("csrf-token 失败", res);
       if (isAuthRateLimit429(res.status, res.text)) {
         const rt = store.runtimeState(account.id);
         rt.authSecurityCooldownUntilMs = computeAuthSecurityCooldownUntilMs();
@@ -1034,22 +1071,17 @@ async function refreshSecurityTokens(account) {
       throw err;
     }
 
-    const signedToken = res.json?.signedToken;
-    const csrfToken = res.json?.csrfToken;
-    const signedTokenExpiresIn = Number(res.json?.signedTokenExpiresIn || 0);
-    const csrfTokenExpiresIn = Number(res.json?.csrfTokenExpiresIn || 0);
-    if (typeof signedToken !== "string" || !signedToken) throw new Error("security-tokens 返回缺少 signedToken");
-    if (typeof csrfToken !== "string" || !csrfToken) throw new Error("security-tokens 返回缺少 csrfToken");
-    if (!signedTokenExpiresIn) throw new Error("security-tokens 返回缺少 signedTokenExpiresIn");
-    if (!csrfTokenExpiresIn) throw new Error("security-tokens 返回缺少 csrfTokenExpiresIn");
+    const csrfToken = res.json?.token;
+    const csrfTokenExpiresInSec = Number(res.json?.expiresIn || res.json?.expires_in || 0);
+    if (typeof csrfToken !== "string" || !csrfToken) throw new Error("csrf-token 返回缺少 token");
 
-    account.security = {
-      signedToken,
+    const nextSecurity = {
       csrfToken,
-      signedExpiresAtMs: now + signedTokenExpiresIn * 1000,
-      csrfExpiresAtMs: now + csrfTokenExpiresIn * 1000,
+      csrfCookie: extractCsrfCookieFromHeaders(res.headers) || `__csrf=${csrfToken}`,
+      csrfExpiresAtMs: now + (csrfTokenExpiresInSec > 0 ? csrfTokenExpiresInSec * 1000 : 24 * 60 * 60 * 1000),
       fetchedAtMs: now
     };
+    account.security = nextSecurity;
     store.runtimeState(account.id).authSecurityCooldownUntilMs = 0;
     await store.save();
     return { refreshed: true };
@@ -1065,9 +1097,8 @@ async function ensureAccountReady(account) {
   if (!account.accessToken) await refreshSupabaseSession(account);
 
   const sec = account.security || null;
-  const signedExpired = !sec?.signedToken || Number(sec.signedExpiresAtMs || 0) - now <= CONFIG.signedRefreshLeewayMs;
   const csrfExpired = !sec?.csrfToken || Number(sec.csrfExpiresAtMs || 0) - now <= CONFIG.csrfRefreshLeewayMs;
-  if (signedExpired || csrfExpired) {
+  if (csrfExpired) {
     await refreshSecurityTokens(account);
   }
 }
@@ -1433,15 +1464,7 @@ async function handleChatCompletions(req, res) {
 
       const zRes = await fetch(url, {
         method: "POST",
-        headers: {
-          accept: "*/*",
-          authorization: `Bearer ${account.accessToken}`,
-          "content-type": "application/json",
-          origin: CONFIG.zerotwoOrigin,
-          referer: `${CONFIG.zerotwoOrigin}/`,
-          "x-csrf-token": account.security.csrfToken,
-          "x-signed-token": account.security.signedToken
-        },
+        headers: buildZeroTwoAuthHeaders(account, { contentType: "application/json", includeCsrf: true }),
         body: JSON.stringify(payload),
         signal: ac.signal
       }).finally(() => clearTimeout(timeout));
@@ -1775,9 +1798,8 @@ async function backgroundTick() {
     if (rt.circuitUntilMs && rt.circuitUntilMs > now) continue;
 
     const needAccess = !a.accessToken || a.accessExpiresAtMs - now <= CONFIG.accessRefreshLeewayMs;
-    const needSigned = !a.security?.signedToken || Number(a.security?.signedExpiresAtMs || 0) - now <= CONFIG.signedRefreshLeewayMs;
     const needCsrf = !a.security?.csrfToken || Number(a.security?.csrfExpiresAtMs || 0) - now <= CONFIG.csrfRefreshLeewayMs;
-    const needSecurity = needSigned || needCsrf;
+    const needSecurity = needCsrf;
     if (!needAccess && !needSecurity) continue;
 
     if (needSecurity) {
@@ -1786,9 +1808,8 @@ async function backgroundTick() {
     }
 
     const dueAccessAt = !a.accessToken ? -Infinity : Number(a.accessExpiresAtMs || 0) - CONFIG.accessRefreshLeewayMs;
-    const dueSignedAt = !a.security?.signedToken ? -Infinity : Number(a.security?.signedExpiresAtMs || 0) - CONFIG.signedRefreshLeewayMs;
     const dueCsrfAt = !a.security?.csrfToken ? -Infinity : Number(a.security?.csrfExpiresAtMs || 0) - CONFIG.csrfRefreshLeewayMs;
-    const dueSecurityAt = Math.min(dueSignedAt, dueCsrfAt);
+    const dueSecurityAt = dueCsrfAt;
     const dueAt = Math.min(needAccess ? dueAccessAt : Infinity, needSecurity ? dueSecurityAt : Infinity);
 
     candidates.push({ a, dueAt });
@@ -1806,9 +1827,8 @@ async function backgroundTick() {
           const rt = store.runtimeState(a.id);
           if (rt.circuitUntilMs && rt.circuitUntilMs > now) return;
           const needAccess = !a.accessToken || a.accessExpiresAtMs - now <= CONFIG.accessRefreshLeewayMs;
-          const needSigned = !a.security?.signedToken || Number(a.security?.signedExpiresAtMs || 0) - now <= CONFIG.signedRefreshLeewayMs;
           const needCsrf = !a.security?.csrfToken || Number(a.security?.csrfExpiresAtMs || 0) - now <= CONFIG.csrfRefreshLeewayMs;
-          const needSecurity = needSigned || needCsrf;
+          const needSecurity = needCsrf;
           if (!needAccess && !needSecurity) return;
           try {
             // Access 与 Security 拆分：避免 Security 的 auth 429 导致 20s 频率反复重试。
