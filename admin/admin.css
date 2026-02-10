@@ -518,6 +518,12 @@ tr:hover td:last-child {
   gap: 24px;
 }
 
+.stats-tools {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
 .stat {
   display: flex;
   flex-direction: column;
@@ -674,6 +680,12 @@ tr.is-disabled td {
   
   .stats {
     margin-top: 12px;
+  }
+
+  .stats-tools {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

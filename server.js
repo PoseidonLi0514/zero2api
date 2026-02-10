@@ -664,6 +664,23 @@ async function setProfileDefaultsOnImport(account, userId) {
   });
 }
 
+function extractProfileSettingsSnapshot(row) {
+  const imageModel =
+    typeof row?.settings?.preferences?.image_model === "string" ? row.settings.preferences.image_model : "";
+  const imageEditModel =
+    typeof row?.settings?.preferences?.image_edit_model === "string" ? row.settings.preferences.image_edit_model : "";
+  const memoryEnabled = row?.settings?.personalization?.enable_memories === true;
+  return { imageModel, imageEditModel, memoryEnabled };
+}
+
+function applyProfileSettingsSnapshotToAccount(account, snapshot) {
+  const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
+  account.imageModel = typeof snap.imageModel === "string" ? snap.imageModel : "";
+  account.imageEditModel = typeof snap.imageEditModel === "string" ? snap.imageEditModel : "";
+  account.memoryEnabled = snap.memoryEnabled === true;
+  account.profileSettingsSyncedAtMs = nowMs();
+}
+
 async function uploadRagFile(account, { threadId, filename, contentType, buffer, processAsync } = {}) {
   if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) throw createBadAttachmentsError("缺少图片文件内容");
   if (buffer.length > CONFIG.maxUploadBytes) throw createBadAttachmentsError("图片过大");
@@ -863,6 +880,10 @@ class TokenStore {
           isPro: Boolean(a.isPro || a.label === "Pro"),
           disabled: Boolean(a.disabled),
           userId: a.userId || "",
+          imageModel: typeof a.imageModel === "string" ? a.imageModel : "",
+          imageEditModel: typeof a.imageEditModel === "string" ? a.imageEditModel : "",
+          memoryEnabled: a.memoryEnabled === true,
+          profileSettingsSyncedAtMs: Number(a.profileSettingsSyncedAtMs || 0),
           refreshToken: a.refreshToken,
           accessToken: a.accessToken || "",
           accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
@@ -885,6 +906,10 @@ class TokenStore {
         isPro: Boolean(a.isPro),
         disabled: Boolean(a.disabled),
         userId: a.userId || "",
+        imageModel: typeof a.imageModel === "string" ? a.imageModel : "",
+        imageEditModel: typeof a.imageEditModel === "string" ? a.imageEditModel : "",
+        memoryEnabled: a.memoryEnabled === true,
+        profileSettingsSyncedAtMs: Number(a.profileSettingsSyncedAtMs || 0),
         refreshToken: a.refreshToken,
         accessToken: a.accessToken || "",
         accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
@@ -916,6 +941,10 @@ class TokenStore {
         isPro: Boolean(a.isPro),
         disabled: Boolean(a.disabled),
         userId: a.userId || "",
+        imageModel: typeof a.imageModel === "string" ? a.imageModel : "",
+        imageEditModel: typeof a.imageEditModel === "string" ? a.imageEditModel : "",
+        memoryEnabled: a.memoryEnabled === true,
+        profileSettingsSyncedAtMs: Number(a.profileSettingsSyncedAtMs || 0),
         accessExpiresAtMs: Number(a.accessExpiresAtMs || 0),
         csrfExpiresAtMs: Number(a.security?.csrfExpiresAtMs || 0),
         inflight: Number(rt.inflight || 0),
@@ -956,6 +985,10 @@ class TokenStore {
       isPro: Boolean(existing?.isPro),
       disabled: false,
       userId,
+      imageModel: typeof existing?.imageModel === "string" ? existing.imageModel : "",
+      imageEditModel: typeof existing?.imageEditModel === "string" ? existing.imageEditModel : "",
+      memoryEnabled: existing?.memoryEnabled === true,
+      profileSettingsSyncedAtMs: Number(existing?.profileSettingsSyncedAtMs || 0),
       refreshToken,
       accessToken: accessToken || existing?.accessToken || "",
       accessExpiresAtMs: accessExpiresAtMs || existing?.accessExpiresAtMs || 0,
@@ -1809,6 +1842,33 @@ async function handleAdminApi(req, res, url) {
     return sendJson(res, 200, { accounts: store.list() });
   }
 
+  if (req.method === "POST" && url.pathname === "/admin/api/accounts/refresh-profile-settings") {
+    const accounts = [...store.accounts.values()].filter((a) => !a.disabled);
+    let refreshed = 0;
+    let failed = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const account of accounts) {
+      if (!account.userId) {
+        skipped += 1;
+        continue;
+      }
+      try {
+        await ensureAccountReady(account);
+        const row = await getProfileSettings(account, account.userId);
+        applyProfileSettingsSnapshotToAccount(account, extractProfileSettingsSnapshot(row));
+        refreshed += 1;
+      } catch (e) {
+        failed += 1;
+        errors.push({ id: account.id, message: String(e?.message || e || "") });
+      }
+    }
+
+    await store.save();
+    return sendJson(res, 200, { ok: true, refreshed, failed, skipped, errors });
+  }
+
   if (req.method === "POST" && url.pathname === "/admin/api/accounts/import") {
     const body = await readBody(req);
     const parsed = safeJsonParse(body.toString("utf8"));
@@ -1833,9 +1893,11 @@ async function handleAdminApi(req, res, url) {
       try {
         await ensureAccountReady(account);
         const patched = await setProfileDefaultsOnImport(account, account.userId);
-        memoryDefaulted = patched?.settings?.personalization?.enable_memories === false;
-        imageModelDefaulted = patched?.settings?.preferences?.image_model === DEFAULT_IMAGE_MODEL_ON_IMPORT;
-        imageEditModelDefaulted = patched?.settings?.preferences?.image_edit_model === DEFAULT_IMAGE_MODEL_ON_IMPORT;
+        const snap = extractProfileSettingsSnapshot(patched);
+        applyProfileSettingsSnapshotToAccount(account, snap);
+        memoryDefaulted = snap.memoryEnabled === false;
+        imageModelDefaulted = snap.imageModel === DEFAULT_IMAGE_MODEL_ON_IMPORT;
+        imageEditModelDefaulted = snap.imageEditModel === DEFAULT_IMAGE_MODEL_ON_IMPORT;
       } catch (e) {
         profileDefaultError = String(e?.message || e || "");
       }
@@ -1901,10 +1963,7 @@ async function handleAdminApi(req, res, url) {
     const id = mImageModel[1];
     const a = store.get(id);
     if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
-    await ensureAccountReady(a);
-    const row = await getProfileSettings(a, a.userId);
-    const image_model =
-      typeof row?.settings?.preferences?.image_model === "string" ? row.settings.preferences.image_model : "";
+    const image_model = typeof a.imageModel === "string" ? a.imageModel : "";
     return sendJson(res, 200, { ok: true, userId: a.userId, image_model, available: IMAGE_MODEL_IDS });
   }
   if (mImageModel && req.method === "POST") {
@@ -1917,8 +1976,10 @@ async function handleAdminApi(req, res, url) {
     const image_model = typeof parsed.value?.image_model === "string" ? parsed.value.image_model : "";
     await ensureAccountReady(a);
     const patched = await setProfileImageModel(a, a.userId, image_model);
-    const next =
-      typeof patched?.settings?.preferences?.image_model === "string" ? patched.settings.preferences.image_model : "";
+    const snap = extractProfileSettingsSnapshot(patched);
+    applyProfileSettingsSnapshotToAccount(a, snap);
+    const next = snap.imageModel;
+    await store.save();
     return sendJson(res, 200, { ok: true, userId: a.userId, image_model: next, available: IMAGE_MODEL_IDS });
   }
 
@@ -1927,10 +1988,7 @@ async function handleAdminApi(req, res, url) {
     const id = mImageEditModel[1];
     const a = store.get(id);
     if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
-    await ensureAccountReady(a);
-    const row = await getProfileSettings(a, a.userId);
-    const image_edit_model =
-      typeof row?.settings?.preferences?.image_edit_model === "string" ? row.settings.preferences.image_edit_model : "";
+    const image_edit_model = typeof a.imageEditModel === "string" ? a.imageEditModel : "";
     return sendJson(res, 200, { ok: true, userId: a.userId, image_edit_model, available: IMAGE_EDIT_MODEL_IDS });
   }
   if (mImageEditModel && req.method === "POST") {
@@ -1943,10 +2001,10 @@ async function handleAdminApi(req, res, url) {
     const image_edit_model = typeof parsed.value?.image_edit_model === "string" ? parsed.value.image_edit_model : "";
     await ensureAccountReady(a);
     const patched = await setProfileImageEditModel(a, a.userId, image_edit_model);
-    const next =
-      typeof patched?.settings?.preferences?.image_edit_model === "string"
-        ? patched.settings.preferences.image_edit_model
-        : "";
+    const snap = extractProfileSettingsSnapshot(patched);
+    applyProfileSettingsSnapshotToAccount(a, snap);
+    const next = snap.imageEditModel;
+    await store.save();
     return sendJson(res, 200, {
       ok: true,
       userId: a.userId,
@@ -1960,9 +2018,7 @@ async function handleAdminApi(req, res, url) {
     const id = mMemory[1];
     const a = store.get(id);
     if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
-    await ensureAccountReady(a);
-    const row = await getProfileSettings(a, a.userId);
-    const enabled = row?.settings?.personalization?.enable_memories === true;
+    const enabled = a.memoryEnabled === true;
     return sendJson(res, 200, { ok: true, userId: a.userId, enabled });
   }
   if (mMemory && req.method === "POST") {
@@ -1977,7 +2033,10 @@ async function handleAdminApi(req, res, url) {
     }
     await ensureAccountReady(a);
     const patched = await setProfileMemoryEnabled(a, a.userId, parsed.value.enabled);
-    const enabled = patched?.settings?.personalization?.enable_memories === true;
+    const snap = extractProfileSettingsSnapshot(patched);
+    applyProfileSettingsSnapshotToAccount(a, snap);
+    const enabled = snap.memoryEnabled;
+    await store.save();
     return sendJson(res, 200, { ok: true, userId: a.userId, enabled });
   }
 
