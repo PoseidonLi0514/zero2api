@@ -64,6 +64,8 @@ const IMAGE_MODEL_IDS = [
   "imagen-4.0-generate-preview-06-06",
   "nano-banana-pro"
 ];
+const IMAGE_EDIT_MODEL_IDS = IMAGE_MODEL_IDS;
+const DEFAULT_IMAGE_MODEL_ON_IMPORT = "nano-banana-pro";
 
 function nowMs() {
   return Date.now();
@@ -543,9 +545,43 @@ async function ensureThreadVectorStore(account, threadId, { provider } = {}) {
   return vectorStoreId;
 }
 
-async function getProfileSettings(account, userId) {
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("缺少 userId");
+async function getSupabaseAuthUser(account) {
+  const url = `${CONFIG.supabaseBase}/auth/v1/user`;
+  const doOnce = async () => {
+    return await fetchJson(url, {
+      method: "GET",
+      headers: {
+        accept: "*/*",
+        apikey: CONFIG.supabaseAnonKey,
+        authorization: `Bearer ${account.accessToken}`
+      }
+    });
+  };
+
+  let res = await doOnce();
+  if (res.status === 401 || res.status === 403) {
+    await refreshSupabaseSession(account);
+    res = await doOnce();
+  }
+  if (!res.ok) throw createUpstreamHttpError("Supabase user 获取失败", res);
+  return res.json || null;
+}
+
+async function resolveProfileUserId(account, userId) {
+  const current = String(userId || account.userId || "").trim();
+  const authUser = await getSupabaseAuthUser(account);
+  const resolved = String(authUser?.id || current).trim();
+  if (!resolved) throw new Error("缺少 userId");
+
+  if (account.userId !== resolved) {
+    account.userId = resolved;
+    await store.save();
+  }
+  return resolved;
+}
+
+async function getProfileSettings(account, userId, { resolvedUserId } = {}) {
+  const uid = String(resolvedUserId || "").trim() || (await resolveProfileUserId(account, userId));
   return await supabasePublicJson(account, `/rest/v1/profiles?select=settings&id=eq.${uid}`, {
     method: "GET",
     headers: { accept: "application/vnd.pgrst.object+json" }
@@ -558,25 +594,12 @@ function cloneJsonValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-async function setProfileImageModel(account, userId, imageModel) {
-  const uid = String(userId || "").trim();
-  if (!uid) throw new Error("缺少 userId");
-
-  const raw = typeof imageModel === "string" ? imageModel.trim() : "";
-  if (raw && !IMAGE_MODEL_IDS.includes(raw)) {
-    throw createBadImageModelError(`不支持的图像模型：${raw}`);
-  }
-
-  const existing = await getProfileSettings(account, uid);
+async function patchProfileSettings(account, userId, updateSettings) {
+  const uid = await resolveProfileUserId(account, userId);
+  const existing = await getProfileSettings(account, uid, { resolvedUserId: uid });
   const settings = existing?.settings && typeof existing.settings === "object" ? existing.settings : {};
   const nextSettings = cloneJsonValue(settings) || {};
-  if (!nextSettings.preferences || typeof nextSettings.preferences !== "object") nextSettings.preferences = {};
-
-  if (!raw) {
-    delete nextSettings.preferences.image_model;
-  } else {
-    nextSettings.preferences.image_model = raw;
-  }
+  updateSettings(nextSettings);
 
   return await supabasePublicJson(account, `/rest/v1/profiles?id=eq.${uid}&select=settings`, {
     method: "PATCH",
@@ -585,6 +608,59 @@ async function setProfileImageModel(account, userId, imageModel) {
       prefer: "return=representation"
     },
     body: { settings: nextSettings, updated_at: new Date().toISOString() }
+  });
+}
+
+async function setProfileImageModel(account, userId, imageModel) {
+  const raw = typeof imageModel === "string" ? imageModel.trim() : "";
+  if (raw && !IMAGE_MODEL_IDS.includes(raw)) {
+    throw createBadImageModelError(`不支持的图像模型：${raw}`);
+  }
+  return await patchProfileSettings(account, userId, (nextSettings) => {
+    if (!nextSettings.preferences || typeof nextSettings.preferences !== "object") nextSettings.preferences = {};
+    if (!raw) {
+      delete nextSettings.preferences.image_model;
+    } else {
+      nextSettings.preferences.image_model = raw;
+    }
+  });
+}
+
+async function setProfileImageEditModel(account, userId, imageEditModel) {
+  const raw = typeof imageEditModel === "string" ? imageEditModel.trim() : "";
+  if (raw && !IMAGE_EDIT_MODEL_IDS.includes(raw)) {
+    throw createBadImageModelError(`不支持的图像编辑模型：${raw}`);
+  }
+  return await patchProfileSettings(account, userId, (nextSettings) => {
+    if (!nextSettings.preferences || typeof nextSettings.preferences !== "object") nextSettings.preferences = {};
+    if (!raw) {
+      delete nextSettings.preferences.image_edit_model;
+    } else {
+      nextSettings.preferences.image_edit_model = raw;
+    }
+  });
+}
+
+async function setProfileMemoryEnabled(account, userId, enabled) {
+  const nextEnabled = Boolean(enabled);
+  return await patchProfileSettings(account, userId, (nextSettings) => {
+    if (!nextSettings.personalization || typeof nextSettings.personalization !== "object") {
+      nextSettings.personalization = {};
+    }
+    nextSettings.personalization.enable_memories = nextEnabled;
+  });
+}
+
+async function setProfileDefaultsOnImport(account, userId) {
+  return await patchProfileSettings(account, userId, (nextSettings) => {
+    if (!nextSettings.preferences || typeof nextSettings.preferences !== "object") nextSettings.preferences = {};
+    nextSettings.preferences.image_model = DEFAULT_IMAGE_MODEL_ON_IMPORT;
+    nextSettings.preferences.image_edit_model = DEFAULT_IMAGE_MODEL_ON_IMPORT;
+
+    if (!nextSettings.personalization || typeof nextSettings.personalization !== "object") {
+      nextSettings.personalization = {};
+    }
+    nextSettings.personalization.enable_memories = false;
   });
 }
 
@@ -1748,8 +1824,32 @@ async function handleAdminApi(req, res, url) {
 
     const account = store.upsertFromAppSession(appSessionParsed.value);
     account.isPro = isPro;
+
+    let memoryDefaulted = false;
+    let imageModelDefaulted = false;
+    let imageEditModelDefaulted = false;
+    let profileDefaultError = "";
+    if (account.userId) {
+      try {
+        await ensureAccountReady(account);
+        const patched = await setProfileDefaultsOnImport(account, account.userId);
+        memoryDefaulted = patched?.settings?.personalization?.enable_memories === false;
+        imageModelDefaulted = patched?.settings?.preferences?.image_model === DEFAULT_IMAGE_MODEL_ON_IMPORT;
+        imageEditModelDefaulted = patched?.settings?.preferences?.image_edit_model === DEFAULT_IMAGE_MODEL_ON_IMPORT;
+      } catch (e) {
+        profileDefaultError = String(e?.message || e || "");
+      }
+    }
+
     await store.save();
-    return sendJson(res, 200, { ok: true, account: { id: account.id } });
+    return sendJson(res, 200, {
+      ok: true,
+      account: { id: account.id },
+      memory_defaulted: memoryDefaulted,
+      image_model_defaulted: imageModelDefaulted,
+      image_edit_model_defaulted: imageEditModelDefaulted,
+      ...(profileDefaultError ? { profile_default_error: profileDefaultError } : {})
+    });
   }
 
   const mTogglePro = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/toggle-pro$/);
@@ -1801,7 +1901,6 @@ async function handleAdminApi(req, res, url) {
     const id = mImageModel[1];
     const a = store.get(id);
     if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
-    if (!a.userId) return sendJson(res, 400, { error: { message: "该账号缺少 userId，无法读取 profiles" } });
     await ensureAccountReady(a);
     const row = await getProfileSettings(a, a.userId);
     const image_model =
@@ -1812,7 +1911,6 @@ async function handleAdminApi(req, res, url) {
     const id = mImageModel[1];
     const a = store.get(id);
     if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
-    if (!a.userId) return sendJson(res, 400, { error: { message: "该账号缺少 userId，无法更新 profiles" } });
     const body = await readBody(req);
     const parsed = safeJsonParse(body.toString("utf8"));
     if (!parsed.ok) return sendJson(res, 400, { error: { message: "JSON 解析失败" } });
@@ -1822,6 +1920,65 @@ async function handleAdminApi(req, res, url) {
     const next =
       typeof patched?.settings?.preferences?.image_model === "string" ? patched.settings.preferences.image_model : "";
     return sendJson(res, 200, { ok: true, userId: a.userId, image_model: next, available: IMAGE_MODEL_IDS });
+  }
+
+  const mImageEditModel = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/image-edit-model$/);
+  if (mImageEditModel && req.method === "GET") {
+    const id = mImageEditModel[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    await ensureAccountReady(a);
+    const row = await getProfileSettings(a, a.userId);
+    const image_edit_model =
+      typeof row?.settings?.preferences?.image_edit_model === "string" ? row.settings.preferences.image_edit_model : "";
+    return sendJson(res, 200, { ok: true, userId: a.userId, image_edit_model, available: IMAGE_EDIT_MODEL_IDS });
+  }
+  if (mImageEditModel && req.method === "POST") {
+    const id = mImageEditModel[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    const body = await readBody(req);
+    const parsed = safeJsonParse(body.toString("utf8"));
+    if (!parsed.ok) return sendJson(res, 400, { error: { message: "JSON 解析失败" } });
+    const image_edit_model = typeof parsed.value?.image_edit_model === "string" ? parsed.value.image_edit_model : "";
+    await ensureAccountReady(a);
+    const patched = await setProfileImageEditModel(a, a.userId, image_edit_model);
+    const next =
+      typeof patched?.settings?.preferences?.image_edit_model === "string"
+        ? patched.settings.preferences.image_edit_model
+        : "";
+    return sendJson(res, 200, {
+      ok: true,
+      userId: a.userId,
+      image_edit_model: next,
+      available: IMAGE_EDIT_MODEL_IDS
+    });
+  }
+
+  const mMemory = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)\/memory$/);
+  if (mMemory && req.method === "GET") {
+    const id = mMemory[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    await ensureAccountReady(a);
+    const row = await getProfileSettings(a, a.userId);
+    const enabled = row?.settings?.personalization?.enable_memories === true;
+    return sendJson(res, 200, { ok: true, userId: a.userId, enabled });
+  }
+  if (mMemory && req.method === "POST") {
+    const id = mMemory[1];
+    const a = store.get(id);
+    if (!a) return sendJson(res, 404, { error: { message: "账号不存在" } });
+    const body = await readBody(req);
+    const parsed = safeJsonParse(body.toString("utf8"));
+    if (!parsed.ok) return sendJson(res, 400, { error: { message: "JSON 解析失败" } });
+    if (typeof parsed.value?.enabled !== "boolean") {
+      return sendJson(res, 400, { error: { message: "enabled 必须是 boolean" } });
+    }
+    await ensureAccountReady(a);
+    const patched = await setProfileMemoryEnabled(a, a.userId, parsed.value.enabled);
+    const enabled = patched?.settings?.personalization?.enable_memories === true;
+    return sendJson(res, 200, { ok: true, userId: a.userId, enabled });
   }
 
   const mDelete = url.pathname.match(/^\/admin\/api\/accounts\/([^/]+)$/);

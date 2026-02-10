@@ -330,6 +330,10 @@ select.image-model {
   cursor: pointer;
 }
 
+.memory-toggle {
+  min-width: 86px;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    Batch Actions Bar
    ───────────────────────────────────────────────────────────────────────────── */
@@ -479,6 +483,26 @@ tr:hover td:last-child {
 
 .btn.danger:hover {
   background: #fee2e2;
+}
+
+.btn.memory-on {
+  background: var(--success-bg);
+  color: var(--success);
+  border-color: var(--success-border);
+}
+
+.btn.memory-on:hover {
+  background: #d1fae5;
+}
+
+.btn.memory-off {
+  background: var(--warning-bg);
+  color: #b45309;
+  border-color: var(--warning-border);
+}
+
+.btn.memory-off:hover {
+  background: #fef3c7;
 }
 
 .btn:disabled {

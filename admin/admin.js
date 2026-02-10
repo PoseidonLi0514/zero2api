@@ -23,6 +23,7 @@ const IMAGE_MODEL_IDS = [
   "imagen-4.0-generate-preview-06-06",
   "nano-banana-pro"
 ];
+const IMAGE_EDIT_MODEL_IDS = IMAGE_MODEL_IDS;
 
 apiKeyEl.value = localStorage.getItem("zt_api_key") || "";
 
@@ -76,11 +77,22 @@ document.getElementById("import").onclick = async () => {
   setStatus("导入中...", "");
   try {
     const raw = appSessionEl.value.trim();
-    await api("/admin/api/accounts/import", {
+    const data = await api("/admin/api/accounts/import", {
       method: "POST",
       body: JSON.stringify({ appSession: raw, isPro: Boolean(isProEl.checked) })
     });
-    setStatus("导入成功。", "ok");
+    const profileDefaultError =
+      typeof data?.profile_default_error === "string" && data.profile_default_error
+        ? data.profile_default_error
+        : typeof data?.memory_default_error === "string" && data.memory_default_error
+          ? data.memory_default_error
+          : "";
+    if (profileDefaultError) {
+      setStatus(`导入成功，但默认配置失败：${profileDefaultError}`, "error");
+      showToast({ title: "默认配置失败", message: profileDefaultError });
+    } else {
+      setStatus("导入成功。", "ok");
+    }
     await load();
   } catch (e) {
     setStatus(`导入失败：${e.message}`, "error");
@@ -168,6 +180,16 @@ function renderTable(accounts) {
         <select class="image-model" data-act="imageModel" data-id="${idEnc}" ${hasUserId ? "" : "disabled"}>
           <option value="">${hasUserId ? "加载中..." : "无 userId"}</option>
         </select>
+      </td>
+      <td>
+        <select class="image-model" data-act="imageEditModel" data-id="${idEnc}" ${hasUserId ? "" : "disabled"}>
+          <option value="">${hasUserId ? "加载中..." : "无 userId"}</option>
+        </select>
+      </td>
+      <td>
+        <button class="btn ghost memory-toggle" data-act="memoryToggle" data-id="${idEnc}" ${hasUserId ? "" : "disabled"}>
+          ${hasUserId ? "加载中..." : "无 userId"}
+        </button>
       </td>
       <td>${a.inflight}/${a.maxInflight}</td>
       <td>${fmtTime(a.accessExpiresAtMs)} <span class="muted">${fmtLeft(a.accessExpiresAtMs)}</span></td>
@@ -313,14 +335,30 @@ batchActionsEl.addEventListener("click", async (e) => {
 });
 
 
-function buildImageModelOptions(current, available) {
-  const list = Array.isArray(available) && available.length ? available : IMAGE_MODEL_IDS;
+function buildModelOptions(current, available, fallbackList) {
+  const list = Array.isArray(available) && available.length ? available : fallbackList;
   const opts = [`<option value="">（未设置）</option>`];
   for (const id of list) {
     const selected = id === current ? " selected" : "";
     opts.push(`<option value="${escapeHtml(id)}"${selected}>${escapeHtml(id)}</option>`);
   }
   return opts.join("");
+}
+
+function buildImageModelOptions(current, available) {
+  return buildModelOptions(current, available, IMAGE_MODEL_IDS);
+}
+
+function buildImageEditModelOptions(current, available) {
+  return buildModelOptions(current, available, IMAGE_EDIT_MODEL_IDS);
+}
+
+function applyMemoryButtonState(btn, enabled) {
+  const on = Boolean(enabled);
+  btn.dataset.enabled = on ? "1" : "0";
+  btn.textContent = on ? "已开启" : "已关闭";
+  btn.classList.toggle("memory-on", on);
+  btn.classList.toggle("memory-off", !on);
 }
 
 async function hydrateImageModelSelects() {
@@ -341,12 +379,58 @@ async function hydrateImageModelSelects() {
   }
 }
 
+async function hydrateImageEditModelSelects() {
+  const selects = tbody.querySelectorAll('select[data-act="imageEditModel"]');
+  for (const sel of selects) {
+    const id = sel.getAttribute("data-id");
+    if (!id || sel.disabled) continue;
+    try {
+      const data = await api(`/admin/api/accounts/${id}/image-edit-model`, { method: "GET" });
+      const current = typeof data?.image_edit_model === "string" ? data.image_edit_model : "";
+      sel.innerHTML = buildImageEditModelOptions(current, data?.available);
+      sel.value = current;
+      sel.dataset.prev = current;
+    } catch (e) {
+      sel.innerHTML = `<option value="">加载失败</option>`;
+      sel.dataset.prev = "";
+    }
+  }
+}
+
+async function hydrateMemoryButtons() {
+  const buttons = tbody.querySelectorAll('button[data-act="memoryToggle"]');
+  for (const btn of buttons) {
+    const id = btn.getAttribute("data-id");
+    if (!id || btn.disabled) continue;
+    try {
+      const data = await api(`/admin/api/accounts/${id}/memory`, { method: "GET" });
+      applyMemoryButtonState(btn, data?.enabled === true);
+    } catch (e) {
+      btn.textContent = "读取失败";
+      btn.dataset.enabled = "0";
+      btn.classList.remove("memory-on", "memory-off");
+    }
+  }
+}
+
 tbody.addEventListener("click", async (event) => {
   const btn = event.target.closest("button[data-act]");
   if (!btn) return;
   const id = btn.getAttribute("data-id");
   const act = btn.getAttribute("data-act");
   try {
+    if (act === "memoryToggle") {
+      const current = btn.dataset.enabled === "1";
+      btn.disabled = true;
+      setStatus("更新 Memory 状态中...", "");
+      const data = await api(`/admin/api/accounts/${id}/memory`, {
+        method: "POST",
+        body: JSON.stringify({ enabled: !current })
+      });
+      applyMemoryButtonState(btn, data?.enabled === true);
+      setStatus(`Memory 已${data?.enabled ? "开启" : "关闭"}。`, "ok");
+      return;
+    }
     if (act === "forceAccess") await api(`/admin/api/accounts/${id}/refresh-access`, { method: "POST" });
     if (act === "forceSecurity") await api(`/admin/api/accounts/${id}/refresh-security`, { method: "POST" });
     if (act === "toggle") await api(`/admin/api/accounts/${id}/toggle`, { method: "POST" });
@@ -364,6 +448,8 @@ tbody.addEventListener("click", async (event) => {
         ? "Access 刷新失败"
         : act === "forceSecurity"
           ? "Security 刷新失败"
+          : act === "memoryToggle"
+            ? "Memory 更新失败"
           : act === "togglePro"
             ? "Pro 设置失败"
             : act === "toggle"
@@ -372,33 +458,46 @@ tbody.addEventListener("click", async (event) => {
                 ? "删除失败"
                 : "操作失败";
     showToast({ title, message: e.message });
+  } finally {
+    if (act === "memoryToggle") {
+      btn.disabled = false;
+    }
   }
 });
 
 tbody.addEventListener("change", async (event) => {
-  const sel = event.target.closest('select[data-act="imageModel"]');
+  const sel = event.target.closest("select[data-act]");
   if (!sel) return;
+  const act = sel.getAttribute("data-act");
+  if (act !== "imageModel" && act !== "imageEditModel") return;
   const id = sel.getAttribute("data-id");
   if (!id) return;
   const next = String(sel.value || "");
   const prev = String(sel.dataset.prev || "");
   if (next === prev) return;
+  const isEdit = act === "imageEditModel";
+  const label = isEdit ? "图像编辑模型" : "图像模型";
+  const endpoint = isEdit ? "image-edit-model" : "image-model";
+  const requestField = isEdit ? "image_edit_model" : "image_model";
+  const responseField = isEdit ? "image_edit_model" : "image_model";
   sel.disabled = true;
-  setStatus("更新图像模型中...", "");
+  setStatus(`更新${label}中...`, "");
   try {
-    const data = await api(`/admin/api/accounts/${id}/image-model`, {
+    const data = await api(`/admin/api/accounts/${id}/${endpoint}`, {
       method: "POST",
-      body: JSON.stringify({ image_model: next })
+      body: JSON.stringify({ [requestField]: next })
     });
-    const current = typeof data?.image_model === "string" ? data.image_model : "";
-    sel.innerHTML = buildImageModelOptions(current, data?.available);
+    const current = typeof data?.[responseField] === "string" ? data[responseField] : "";
+    sel.innerHTML = isEdit
+      ? buildImageEditModelOptions(current, data?.available)
+      : buildImageModelOptions(current, data?.available);
     sel.value = current;
     sel.dataset.prev = current;
-    setStatus("图像模型已更新。", "ok");
+    setStatus(`${label}已更新。`, "ok");
   } catch (e) {
     sel.value = prev;
-    setStatus(`图像模型更新失败：${e.message}`, "error");
-    showToast({ title: "图像模型更新失败", message: e.message });
+    setStatus(`${label}更新失败：${e.message}`, "error");
+    showToast({ title: `${label}更新失败`, message: e.message });
   } finally {
     sel.disabled = false;
   }
@@ -414,6 +513,8 @@ async function load() {
     proCountEl.textContent = String(proCount);
     renderTable(accounts);
     hydrateImageModelSelects().catch(() => {});
+    hydrateImageEditModelSelects().catch(() => {});
+    hydrateMemoryButtons().catch(() => {});
     setStatus("就绪。", "ok");
   } catch (e) {
     setStatus(`加载失败：${e.message}（请先填写正确的 API Key）`, "error");
